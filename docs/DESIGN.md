@@ -365,6 +365,8 @@ B ◄──Data(/w)──► Server ◄──Data(重编码 /w)──► A ◄�
 
 ## 9. 安全模型与威胁分析
 
+> GFW 封锁原理的完整调研见 [附录 A](#附录-agfw-威胁模型与对抗映射) 与 [docs/GFW-RESEARCH.md](GFW-RESEARCH.md)。
+
 | 威胁 | 对策 |
 | --- | --- |
 | 未授权接入 | `secret` + HMAC 挑战；错误即拒绝 |
@@ -495,6 +497,7 @@ server {
 
 ## 13. 限制与未来工作
 
+- **传输层约束**：v1 仅走 TCP + TLS（WS/SSE/POST），**不使用 QUIC/HTTP3**——规避当前最活跃的 QUIC-SNI 解密封锁面（见附录 A.3）；未来可评估 ECH 或 QUIC 载体。
 - **UDP**：当前仅 TCP（SOCKS5 `CONNECT`）；未来支持 `UDP ASSOCIATE`。
 - **数据面多载体随机化**：`data_mix` 开启后，每流可随机选「WS / POST 分块上传 + SSE 下载」，实现数据面的载体随机（需每流重排缓冲）。
 - **端到端加密**：引入节点间 X25519 协商，实现 B↔A 全程加密（服务端不可读）。
@@ -508,6 +511,7 @@ server {
 my-websocket-net/
 ├── Cargo.toml
 ├── docs/DESIGN.md
+├── docs/GFW-RESEARCH.md
 ├── README.md
 ├── src/
 │   ├── lib.rs
@@ -526,3 +530,40 @@ my-websocket-net/
 │       └── wsnet.rs
 └── tests/e2e.rs
 ```
+
+## 附录 A：GFW 威胁模型与对抗映射
+
+> 完整调研见 [docs/GFW-RESEARCH.md](GFW-RESEARCH.md)（2024–2025 学术与公开测量研究）。
+
+### A.1 GFW 封锁手段归纳
+
+| 类型 | 手段 | 原理 | 粒度 |
+| --- | --- | --- | --- |
+| 被动 | DNS 污染/劫持 | 注入伪造 DNS 应答 | 域名 |
+| 被动 | IP 封锁/黑洞路由 | 黑名单 IP 丢包或黑洞 | IP:port |
+| 被动 | SNI 明文检测 | TLS ClientHello 的 SNI 明文命中即注入 RST | 域名（双向 RST） |
+| 被动 | HTTP Host 关键字过滤 | 明文 Host 头匹配 | URL |
+| 被动 | TLS 指纹（JA3/JA4） | 握手特征识别「非正常 HTTPS」 | 协议/工具 |
+| 被动 | 协议指纹 | 识别 OpenVPN/WireGuard/SS/VMess 等 | 协议 |
+| 被动 | 统计/熵/时序分析 | AI/ML 识别「加密但非正常 HTTPS」 | 连接/流 |
+| 主动 | 握手重放探测 | 重放合法握手，观察是否返回「正确协议响应」 | 服务器 IP:port |
+| 主动 | 端口枚举 | 逐端口建立连接探测 | 服务器 |
+| 新兴 | QUIC SNI 解密封锁 | 大规模解密 QUIC Initial 做 SNI 封锁（2024-04 起） | 域名 |
+
+### A.2 对抗映射
+
+| GFW 手段 | wsnet 对抗设计 | 章节 |
+| --- | --- | --- |
+| 主动探测 + 握手重放 | 防重放 + 按协议类型返回伪装内容 | §5.1、§4.2、§9.1 |
+| 协议指纹识别 | 三载体随机分发 + 统一 AEAD 信封（不可区分） | §1.1、§6 |
+| 统计/熵/时序分析 | 伪装流量 + 正常站点（降低高熵特征） | §6.4、§6.5 |
+| SNI/DPI 明文检测 | 标准 WS + nginx TLS + 正常域名 SNI | §11 |
+| QUIC SNI 解密封锁 | v1 仅 TCP+TLS，不依赖 QUIC | §13、A.3 |
+| IP:port 粒度封锁 | wsnetd 与正常 HTTPS 站点同 IP（回落） | §6.5、§11 |
+| 探测响应确认 | 伪装响应与「正常失败」不可区分 | §9.1 |
+
+### A.3 关键设计决策
+
+1. **传输层（v1）**：仅使用 TCP + TLS（WS/SSE/POST），**不启用 QUIC/HTTP3**。依据：GFW 自 2024-04 起对 QUIC 做 SNI 级解密封锁（全球首例，90% 在 <1s 内生效），是当前最活跃、最难规避的攻击面；TCP+TLS 的 WS/SSE/POST 可稳定穿过 nginx 且 SNI 为正常域名。**代价**：牺牲 QUIC 的 0-RTT / 多路复用性能。**未来**：评估 ECH（截至 2025 初 GFW 不封锁含 ECH 的 QUIC）或对 QUIC 载体做 SNI 分片。
+2. **IP 身份**：wsnetd 应部署在**正常 HTTPS 站点同 IP**（nginx 同端口回落），避免出现「仅代理特征」的独立 IP，降低 IP:port 粒度封锁风险。
+3. **主动探测对抗优先级**：把「重放时按协议类型返回伪装内容」（§9.1）作为**必需项**而非可选——GFW 主动探测正是通过「重放握手观察响应」来确认代理身份，响应的不可区分性是第一道防线。
