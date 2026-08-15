@@ -13,6 +13,7 @@
 ## 文档
 
 - 设计文档：[docs/DESIGN.md](docs/DESIGN.md)
+- GFW 封锁原理调研：[docs/GFW-RESEARCH.md](docs/GFW-RESEARCH.md)
 
 ## 状态
 
