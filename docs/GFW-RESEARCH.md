@@ -1,101 +1,97 @@
-# GFW（中国防火长城）封锁原理调研报告
+# GFW 封锁机制：历史资料梳理与证据边界
 
-> 调研时间：2025 年；数据来源：2024–2025 年发表的学术论文与公开测量研究（USENIX Security 2025、gfw.report、DomainTools、arxiv 等）。
-> 用途：为 wsnet 代理的**抗检测 / 抗封锁**设计提供威胁模型依据。
+> 状态：对仓库已有调研报告的证据降格与技术纠错，不是新的联网调研。本轮未访问外部来源、未做网络测量，链接沿用已有引用。
+> 时间范围：主要引用 2015 及 2024–2025 年研究；发表时间不等于测量时间，旧观察不能推断当前全网政策。
+> 用途：为 [设计文档](DESIGN.md) 提供有条件的威胁背景，不证明本项目已具备抗识别或抗封锁能力。
 
-## 1. 概述
+## 1. 如何阅读本报告
 
-GFW（Great Firewall，防火长城）是一套**模块化、分层、区域分布式**的国家级网络审查系统，核心由**深度包检测（DPI）模块 + 动态封锁名单 + 主动探测**构成，部署在骨干网与省级运营商网关。它已从早期的「IP 封锁 / DNS 污染 / 关键字过滤」演进为**主动探测 + 流量指纹识别 + AI/ML 辅助分析**的综合体系。
+区分四种证据：① 协议规范事实；② 已引用论文报告的特定时间/测量点观察；③ 二手博客/媒体说法；④ 本项目待验证假设。下文不将③④写成已证部署事实。具体数字、线路和实验条件应在未来复核原文后引用；本轮不新增“最新”结论。
 
-> 来源：[DomainTools — Inside the Great Firewall Part 2](https://dti.domaintools.com/research/inside-the-great-firewall-part-2-technical-infrastructure)、[wallmama — 翻墙与科学上网指南](https://www.wallmama.com/comment-page-2)
+“GFW”通常用于统称多种网络干扰现象。不能仅凭单条连接超时断言是GFW，也不能从论文测到不同注入行为推导精确组织、全国硬件规模、统一评分系统或某个厂商产品部署。区域、运营商、方向、协议与时间均可能不同。
 
-## 2. 封锁手段分类
+## 2. 机制、证据和限制
 
-### 2.1 被动封锁（流量经过时检测，最常见）
+### 2.1 DNS、HTTP、TLS 与地址干扰
 
-| 手段 | 原理 | 粒度 / 特征 |
+| 机制 | 可支持的表述 | 限制 |
 | --- | --- | --- |
-| **DNS 污染 / 劫持** | 向 DNS 查询注入伪造应答，返回污染 IP；对 DoH/DoT 按 IP:port + SNI 封锁 | 域名级 |
-| **IP 封锁 / 黑洞路由** | 黑名单 IP 直接丢包或路由黑洞；实际按 **IP:port 元组**（非仅 IP）封锁 | IP:port 级 |
-| **SNI 明文检测** | TLS ClientHello 的 SNI 扩展为明文，命中黑名单域名即注入 TCP RST | 域名级，双向 RST |
-| **HTTP Host 关键字过滤** | 明文 HTTP 的 Host 头关键字匹配 | URL 级 |
-| **TLS 指纹（JA3/JA4）** | 不解密，靠握手特征识别「加密但不是正常 HTTPS」的流量 | 协议 / 工具级 |
-| **协议指纹** | 识别 OpenVPN、WireGuard、Shadowsocks、VMess、Trojan 的握手 / 统计特征 | 协议级 |
+| DNS 注入 | 历史研究与资料报告过伪造DNS应答及污染现象 | TTL/IPID特征、设备规模和吞吐不是当前稳定常量；本报告删除旧节点数量/吞吐数字的当前事实表述 |
+| HTTP Host / TLS SNI检测 | 已引用区域审查论文讨论明文Host、未使用ECH时可见的TLS ClientHello SNI与RST注入 | Host是主机名，不等于完整URL；HTTPS内URL通常不可见；TLS1.3本身并不自动隐藏普通SNI |
+| TCP RST / 丢包 | 文献报告存在注入RST和后续连接受影响等行为 | 丢包不能单独证明黑洞路由；残留阻断不等于已证“全局评分机制” |
+| IP / IP:port等粒度 | 不同机制和历史测量可出现不同粒度阻断 | 不能统一写成“实际都按IP:port”；同正常站点共IP不能保证免封 |
 
-**DNS 污染细节**：注入的伪造应答具有可辨识的固定特征（TTL、IPID 模式）；注入是**双向**的，境外 DNS 途经中国时也会被污染，导致大量国外递归解析器缓存被污染。GFW 的一个 DNS 计算集群约 360 个节点，每节点每秒处理约 2800 个 DNS 包。
+主要历史引用：[区域审查研究（S&P 2025，中文）](https://gfw.report/publications/sp25/zh)。本文仅保留文献所报告的有限观察，不断言其适用于所有当前线路。
 
-> 来源：[DNS 污染 / TCP 重置详解](https://blog.luckysix.cc/2024/08/25/%E7%BF%BB%E5%A2%99%E8%BD%AF%E4%BB%B6%E7%9A%84%E5%AF%B9%E6%89%8B%E9%95%BF%E5%9F%8E%E9%98%B2%E7%81%AB%E5%A2%99-GFW-%E6%98%AF%E5%A6%82%E4%BD%95%E6%A3%80%E6%B5%8B%E5%92%8C%E5%B0%81%E9%94%81%E6%B5%81%E9%87%8F%E7%9A%84)、[游戏和谐 Wiki — GFW](https://ggame.gledos.science/censorship/%E6%8A%80%E6%9C%AF/GFW.html)
+### 2.2 主动探测与重放
 
-### 2.2 主动探测（Active Probing）—— 与「防重放」需求直接相关
+[IMC 2015 论文](https://conferences2.sigcomm.org/imc/2015/papers/p445.pdf) 对疑似规避服务的主动探测作系统研究，可作为“对端可能发送探测/重放请求”的威胁模型依据。并非所有协议都能用同一种握手重放识别，也不能把“目前仍是主流、所有端口都会枚举”当本文新测结论。
 
-这是对代理服务器最具威胁的一类：**GFW 伪装成客户端，主动连接疑似代理服务器**，识别后封锁。手段包括：
+标准TLS观察者通常不能把一条连接中的应用明文直接从TLS密文读出再重放；内部认证记录被日志/端点泄露、代理终结TLS或协议本身不使用TLS是不同攻击条件。应用仍需防重放，但须说明攻击者拥有的是TLS密文、内部记录还是凭据。
 
-- **握手重放**：捕获一段合法客户端流量（如 VMess / Shadowsocks 的认证头），再主动重放到服务器；若服务器给出「正确协议响应」，即确认是代理 → 封 IP:port。
-- **端口枚举**：对可疑 IP 的每个端口逐一建立连接探测（Tor bridge 曾因此被逐端口封锁）。
-- 首次系统揭示于 2015 年 IMC 论文；至今仍是主流手段。
+返回普通站点内容能减少特定错误差异，不保证身份不可确认：正常服务差异、长度、时序和状态行为仍可能被关联。设计中的防重放、业务幂等与响应外观必须分别验收。
 
-> 来源：[How the Great Firewall Discovers Hidden Circumvention Servers (IMC 2015)](https://conferences2.sigcomm.org/imc/2015/papers/p445.pdf)、[Wikipedia — Great Firewall](https://en.wikipedia.org/wiki/Great_Firewall)、[arxiv 2503.02018](https://arxiv.org/html/2503.02018v1)
+### 2.3 TLS 指纹、熵与行为分析
 
-**与 wsnet 设计的对应**：wsnet §9.1「重放时按协议类型返回伪装内容」正是对抗此机制——若重放探测得到代理特有错误，等于自报身份；返回与正常服务无异的伪装内容，探测者就无法确认目标身份。
+- TLS ClientHello特征、ALPN、包长/方向/时序可用于分类；JA3/JA4是特征表示，不是浏览器身份的密码学证明。
+- 现有仓库引用不足以证明GFW在所有线路广泛部署JA4或某AI/ML分类器；“2023–2024起普遍AI识别”等表述降为**未验证说法**。
+- TLS应用密文本身已接近高熵，不能声称真实HTTPS密文是低熵结构化内容、内部再加密就显著升高外部可见熵，或HTML背景请求可降低TLS密文熵。
+- 不具备TLS终结能力的中间观察者通常看不到URL、Cookie、MIME、JS是否执行；可能看到它们在尺寸/时序上的间接效应，但不能将推测写成已证浏览器请求图谱检测部署。
+- 指纹profile、padding和背景请求是本项目实验方向，不是实证对策；额外流量还可能恶化弱网或产生新的特征。
 
-### 2.3 统计 / 行为分析（被动，AI/ML 强化）
+## 3. QUIC、ECH 与地区差异的历史观察
 
-- **熵分析**：代理加密流量通常呈高熵（随机），与真实 TLS 结构化内容不同。
-- **包长 / 时序特征**：对流量模式、包长度、时间特征做机器学习分类。
-- 2023–2024 起越来越多使用 AI/ML 流量识别，动态判断「加密但非正常 HTTPS 流量」。
+[USENIX Security 2025 页面](https://www.usenix.org/conference/usenixsecurity25/presentation/zohaib) 与[中文论文页面](https://gfw.report/publications/usenixsecurity25/zh) 报告从2024年4月起观察到针对QUIC的SNI干扰，并讨论2025年3月的行为变化。以下必须保留边界：
 
-> 来源：[wallmama](https://www.wallmama.com/comment-page-2)
+- QUIC Initial的初始密钥由公开信息推导，观察者解析其中ClientHello不等于破解TLS 1.3或解密完整QUIC应用会话。
+- 论文中的封锁比例、响应时间、残留时间、地域和方向条件不外推为当前全国统一数值；本轮删除无上下文“90%小于1秒”“最活跃最难规避”“全球首例”等设计依据。
+- ECH用于保护ClientHello中的敏感字段，但其可用性取决于客户端、DNS配置、服务端与网络策略。旧实验“某些ECH流量当时未触发”不能变成“ECH不封锁”“长期普适有效”。本轮没有验证当前ECH状态。
+- 区域研究支持对地域/线路差异保持警惕，不证明所有地区协调方式或内部拓扑。
+- “2025年全国/全球境外443全面封锁”“Let's Encrypt CRL普遍封锁”等仅有二手线索，本报告**不作为已证事实或版本设计依据**；若后续讨论，需列出明确日期、持续时间、地区、目标和对照测量。
 
-## 3. 2024–2025 最新趋势
+## 4. 可追踪的历史线索（非完整演进史）
 
-1. **QUIC / HTTP3 的 SNI 封锁（全球首例）**：2024-04-07 起，GFW 开始**大规模解密 QUIC Initial 包**做 SNI 级封锁，采用独立于其他机制的封锁名单；90% 的封锁在 <1s 内生效，封锁强度与算力相关（高负载时审查效率下降）。
-   - 关键缺陷：解密开销大，中等流量负载即削弱封锁效果，并可被滥用阻断任意 UDP 流量。
-   - 2025-03-13 起，境外发起的 QUIC 流量不再触发封锁（部分缓解）。
-2. **ECH 成为有效对抗**：截至 2025 初，GFW **不封锁**含 ECH（Encrypted ClientHello）的 QUIC。
-3. **区域化 / 协作式审查**：出现独立的「河南墙」等区域系统，封锁策略与骨干网 GFW 不完全同步。
-4. **TCP 非合规行为 / 双向 RST**：2024 研究证实 GFW 会双向注入 RST，可被外部测量；封锁存在「评分」机制，先前连接被封锁会影响后续连接。
-5. **2025 年新动作**：8 月屏蔽境外 443 端口、屏蔽 Let's Encrypt 的 CRL 域名。
+| 发表/观察时间 | 保留内容 | 证据边界 |
+| --- | --- | --- |
+| 2015 IMC | 主动探测研究 | 历史协议/测量环境，不据此宣布当下统一探测规则 |
+| 2024–2025测量、2025发表 | QUIC Initial/SNI相关干扰论文 | 限论文报告的时间、测量点、方向及协议条件 |
+| 2025 S&P | 区域审查差异研究 | 不从局部结论推导全国组织结构或永久策略 |
 
-> 来源：[USENIX Security 2025 — QUIC SNI Censorship](https://www.usenix.org/conference/usenixsecurity25/presentation/zohaib) / [中文版](https://gfw.report/publications/usenixsecurity25/zh)、[gfw.report — 墙中之墙](https://gfw.report/publications/sp25/zh)、[Medium — Inside the Great Firewall](https://medium.com/btcvpn/inside-the-great-firewall-how-chinas-censorship-machine-really-works-and-how-to-beat-it-b92b3be410a2)、[Wikipedia](https://en.wikipedia.org/wiki/Great_Firewall)
+删除旧报告中未经逐项证明的“2002→2025各阶段主要策略”“AI普及时间线”。未来修订应记 source URL、发表时间、实际测量时段、地点/方向、方法与复现状态；本轮复现状态均为未复现。
 
-## 4. 时间线（关键节点）
+## 5. 对 wsnet 的有限设计映射
 
-| 时间 | 事件 |
-| --- | --- |
-| 2002 起 | DNS 污染出现 |
-| 2011 前 | 主要靠关键字过滤 + IP 黑名单 |
-| 2015 | 主动探测机制被系统揭示 |
-| 2019–2020 | IP 封锁 / DNS 污染 / 关键字过滤为主 |
-| 2020–2021 | 普遍使用主动探测（V2Ray、Shadowsocks 握手） |
-| 2021–2022 | DPI 增强，监控 TLS1.3+ESNI |
-| 2023–2024 | AI/ML 流量识别；分布式封锁（省市不同步） |
-| 2024-04-07 | GFW 开始 QUIC SNI 解密封锁 |
-| 2025-03-13 | 境外 QUIC 流量不再触发封锁 |
-| 2025-08-20 | 屏蔽境外 443 端口 |
+| 风险 | 本项目选择 | 不能声称 |
+| --- | --- | --- |
+| 主动探测/内部记录重放 | 原子nonce登记、方向key隔离、协议阶段失败外观 | 一个正常Close/HTML响应就能隐藏代理 |
+| TLS/统计特征分类 | 可维护标准TLS、profile一致性评估、限预算对照测试 | 已模拟真实浏览器或已对抗特定分类器 |
+| 单载体失败/网络质量差 | 实际POST+SSE/POST响应数据fallback、offset/credit、有界恢复 | 背景请求成功即业务成功；随机复制必然提升质量 |
+| 地址/域名可见性 | 保留标准证书验证、明确Hub部署边界 | 正常域名、共IP或TLS可规避IP/SNI封锁 |
+| 多线路与区域变化 | 多Hub注册，新连接故障转移 | 跨Hub迁移存量TCP或自动恢复未知业务副作用 |
+| QUIC相关历史观察 | v1选TCP+TLS以控制复杂度并兼容nginx | TCP比QUIC天然安全、ECH必有效 |
 
-> 来源：[wallmama](https://www.wallmama.com/comment-page-2)、[游戏和谐 Wiki](https://ggame.gledos.science/censorship/%E6%8A%80%E6%9C%AF/GFW.html)、[USENIX 2025](https://www.usenix.org/conference/usenixsecurity25/presentation/zohaib)
+规范内容以 [DESIGN.md](DESIGN.md) 的 §4–§12 为准；本文是背景，不为未测试功能背书。
 
-## 5. 对 wsnet 设计的映射
+## 6. 来源分级与待核实列表
 
-| GFW 手段 | wsnet 对抗设计 |
-| --- | --- |
-| 主动探测 + 握手重放 | §9.1 按协议类型伪装响应 + 防重放（nonce 缓存 / AEAD counter） |
-| 协议指纹识别 | §6 三载体随机分发 + 统一 AEAD 信封（不可区分） |
-| 统计 / 熵 / 时序分析 | §6.4 伪装流量 + §6.5 正常站点（降低高熵特征） |
-| SNI / DPI 明文检测 | §11 标准 WS + nginx TLS + 正常域名 SNI |
-| QUIC SNI 解密封锁 | v1 走 TCP+TLS+WS（不依赖 QUIC）；未来评估 ECH |
-| IP:port 粒度封锁 | wsnetd 与正常 HTTPS 站点同 IP（回落），避免独立特征 IP |
+### 优先复核的原始研究入口（本轮未重新访问）
 
-## 6. 参考资料
+- [QUIC SNI Censorship，USENIX Security 2025](https://www.usenix.org/conference/usenixsecurity25/presentation/zohaib)
+- [QUIC SNI 研究中文页](https://gfw.report/publications/usenixsecurity25/zh)
+- [区域审查研究中文页，S&P 2025](https://gfw.report/publications/sp25/zh)
+- [Active Probing，IMC 2015 PDF](https://conferences2.sigcomm.org/imc/2015/papers/p445.pdf)
 
-- [Exposing and Circumventing SNI-based QUIC Censorship of the Great Firewall of China (USENIX Security 2025)](https://www.usenix.org/conference/usenixsecurity25/presentation/zohaib)
-- [揭示并绕过中国防火长城基于 SNI 的 QUIC 封锁机制（中文）](https://gfw.report/publications/usenixsecurity25/zh)
-- [墙中之墙：中国地区性审查的兴起 (gfw.report, S&P 2025)](https://gfw.report/publications/sp25/zh)
-- [Inside the Great Firewall Part 2: Technical Infrastructure (DomainTools)](https://dti.domaintools.com/research/inside-the-great-firewall-part-2-technical-infrastructure)
-- [How the Great Firewall Discovers Hidden Circumvention Servers (IMC 2015)](https://conferences2.sigcomm.org/imc/2015/papers/p445.pdf)
-- [Advancing Obfuscation Strategies to Counter China's Great Firewall (arxiv 2503.02018)](https://arxiv.org/html/2503.02018v1)
-- [Inside the Great Firewall: How China's Censorship Machine Really Works (Medium/BTCVPN)](https://medium.com/btcvpn/inside-the-great-firewall-how-chinas-censorship-machine-really-works-and-how-to-beat-it-b92b3be410a2)
-- [翻墙软件的对手长城防火墙 GFW 是如何检测和封锁流量的（星宇博客）](https://blog.luckysix.cc/2024/08/25/%E7%BF%BB%E5%A2%99%E8%BD%AF%E4%BB%B6%E7%9A%84%E5%AF%B9%E6%89%8B%E9%95%BF%E5%9F%8E%E9%98%B2%E7%81%AB%E5%A2%99-GFW-%E6%98%AF%E5%A6%82%E4%BD%95%E6%A3%80%E6%B5%8B%E5%92%8C%E5%B0%81%E9%94%81%E6%B5%81%E9%87%8F%E7%9A%84)
-- [Great Firewall (Wikipedia)](https://en.wikipedia.org/wiki/Great_Firewall) / [防火长城 (维基百科)](https://zh.wikipedia.org/zh-hans/%E9%98%B2%E7%81%AB%E9%95%BF%E5%9F%8E)
-- [GFW — 游戏和谐 Wiki](https://ggame.gledos.science/censorship/%E6%8A%80%E6%9C%AF/GFW.html)
-- [墙妈妈 — 翻墙与科学上网指南](https://www.wallmama.com/comment-page-2)
+### 保留为二手/待核实线索，不直接用于现状断言
+
+- [DomainTools 基础设施分析](https://dti.domaintools.com/research/inside-the-great-firewall-part-2-technical-infrastructure)：内部部署/JA3说法需核实来源链与覆盖范围。
+- [arXiv 2503.02018](https://arxiv.org/html/2503.02018v1)：预印本/综述线索，应追原始测量。
+- [Medium/BTCVPN 文章](https://medium.com/btcvpn/inside-the-great-firewall-how-chinas-censorship-machine-really-works-and-how-to-beat-it-b92b3be410a2)：ECH普适结论不可直接采用。
+- [Wikipedia](https://en.wikipedia.org/wiki/Great_Firewall)：百科用于索引原始研究，不当最新测量。
+- [游戏和谐 Wiki](https://ggame.gledos.science/censorship/%E6%8A%80%E6%9C%AF/GFW.html)：443/CRL等事件线索需限定时地和对照复核。
+- [墙妈妈](https://www.wallmama.com/comment-page-2)：AI普及/技术演进时间线不作为本项目已证依据。
+
+## 7. 本轮修订与验证状态
+
+修正了TLS熵与可见性、Host/URL粒度、QUIC Initial含义；将JA4/AI普遍部署、ECH长期有效、全面443封锁、精确设备吞吐与全局评分等断言删除或降格。保留历史研究入口和与设计的双向链接。
+
+没有新联网调研、抓包、协议测试或封锁复现；仅文档静态自查。后续证据更新不能用未经限定的博客结论自动改变安全默认值。
