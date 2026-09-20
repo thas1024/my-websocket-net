@@ -1,0 +1,19 @@
+﻿[package]
+name = "wsnet-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wsnet directional key derivation, nonce, and AEAD envelope (DESIGN.md §4.2, §5.1)"
+
+[dependencies]
+wsnet-limits.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+rand.workspace = true
+thiserror.workspace = true

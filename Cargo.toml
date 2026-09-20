@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wsnet-limits",
+    "crates/wsnet-protocol",
+    "crates/wsnet-crypto",
+    "crates/wsnet-auth-store",
+    "crates/wsnet-operation",
+    "crates/wsnet-stream",
+    "crates/wsnet-transport",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/thas1024/my-websocket-net"
+description = "wsnet — hybrid-carrier lightweight proxy (design-stage implementation)"
+
+[workspace.dependencies]
+wsnet-limits = { path = "crates/wsnet-limits" }
+wsnet-protocol = { path = "crates/wsnet-protocol" }
+wsnet-crypto = { path = "crates/wsnet-crypto" }
+wsnet-auth-store = { path = "crates/wsnet-auth-store" }
+wsnet-operation = { path = "crates/wsnet-operation" }
+wsnet-stream = { path = "crates/wsnet-stream" }
+wsnet-transport = { path = "crates/wsnet-transport" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["std"] }
+thiserror = "1"
+
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+
+hex = "0.4"
+base64 = "0.22"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

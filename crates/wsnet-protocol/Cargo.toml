@@ -1,0 +1,12 @@
+[package]
+name = "wsnet-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wsnet v1 message kinds, canonical metadata, and record framing (DESIGN.md §4.1)"
+
+[dependencies]
+wsnet-limits.workspace = true
+thiserror.workspace = true

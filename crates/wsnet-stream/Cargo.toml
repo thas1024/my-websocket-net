@@ -1,0 +1,12 @@
+﻿[package]
+name = "wsnet-stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wsnet stream offsets, byte credit, and bounded reorder (DESIGN.md §7.3, §7.5)"
+
+[dependencies]
+wsnet-limits.workspace = true
+thiserror.workspace = true
