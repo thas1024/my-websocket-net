@@ -1,0 +1,16 @@
+[package]
+name = "wsnet-forward"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wsnet Local Forward listeners and lifecycle (DESIGN.md §7.6, USAGE.md §5-§7)"
+
+[dependencies]
+wsnet-limits.workspace = true
+wsnet-routing.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ipnet.workspace = true

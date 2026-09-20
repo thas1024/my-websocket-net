@@ -127,6 +127,24 @@ impl ReorderBuffer {
     ///   the peer's block boundaries disagree with ours and cannot be verified.
     /// * A gap is buffered, bounded by the byte budget.
     pub fn insert(&mut self, offset: u64, data: &[u8]) -> Result<Vec<Vec<u8>>, StreamError> {
+        Ok(self
+            .insert_offsets(offset, data)?
+            .into_iter()
+            .map(|(_, bytes)| bytes)
+            .collect())
+    }
+
+    /// Like [`ReorderBuffer::insert`], but each delivered block carries the
+    /// absolute offset it starts at.
+    ///
+    /// The session engine needs those offsets: they are what it puts into the
+    /// `Data` metadata of the next hop, and §4.1 requires an offset to mean "the
+    /// start of this direction's original business bytes, excluding framing".
+    pub fn insert_offsets(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Vec<(u64, Vec<u8>)>, StreamError> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
@@ -191,9 +209,10 @@ impl ReorderBuffer {
         // Drain everything that is now contiguous.
         let mut delivered = Vec::new();
         while let Some(block) = self.pending.remove(&self.next) {
+            let start = self.next;
             self.next += block.len() as u64;
             self.buffered -= block.len();
-            delivered.push(block);
+            delivered.push((start, block));
         }
         Ok(delivered)
     }

@@ -241,6 +241,116 @@ pub const BACKGROUND_MAX_PER_SESSION: usize = 1;
 pub const BACKGROUND_BUDGET_BYTES_PER_SEC: usize = kib(4);
 
 // ---------------------------------------------------------------------------
+// §9.2 DoS budgets and §9.1 failure appearance
+// ---------------------------------------------------------------------------
+
+/// Concurrent unauthenticated connections accepted per source IP.
+pub const MAX_UNAUTH_CONNECTIONS_PER_IP: usize = 20;
+
+/// Sustained authentication attempts per second per source IP.
+pub const AUTH_RATE_PER_SEC: u32 = 5;
+
+/// Authentication burst allowance per source IP.
+pub const AUTH_BURST: u32 = 10;
+
+/// Handshake deadline, in milliseconds.
+pub const HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+
+/// Maximum concurrent streams per session.
+pub const MAX_STREAMS_PER_SESSION: usize = 256;
+
+/// Upper bound on any unauthenticated failure response body ("最多16 KiB").
+pub const FAILURE_MAX_BODY: usize = kib(16);
+
+/// Upper bound on how long an unauthenticated failure appearance may persist
+/// ("或5秒").
+pub const FAILURE_MAX_DURATION_MS: u64 = 5_000;
+
+/// Maximum size of a built-in site resource served from memory.
+pub const MAX_SITE_RESOURCE: usize = kib(64);
+
+// ---------------------------------------------------------------------------
+// §7.4 UDP association budgets
+// ---------------------------------------------------------------------------
+
+/// Maximum distinct targets tracked by one UDP association.
+pub const MAX_UDP_TARGETS_PER_ASSOCIATION: usize = 64;
+
+/// Maximum queued datagrams per association.
+pub const MAX_QUEUED_DATAGRAMS_PER_ASSOCIATION: usize = 32;
+
+/// Maximum queued bytes per association.
+pub const MAX_QUEUED_DATAGRAM_BYTES: usize = kib(256);
+
+/// Default send-queue TTL for a relayed datagram, in milliseconds.
+pub const UDP_QUEUE_TTL_DEFAULT_MS: u64 = 1_000;
+
+/// Minimum configurable queue TTL.
+pub const UDP_QUEUE_TTL_MIN_MS: u64 = 100;
+
+/// Maximum configurable queue TTL.
+pub const UDP_QUEUE_TTL_MAX_MS: u64 = 5_000;
+
+/// Default maximum UDP payload accepted from SOCKS5, leaving room for headers.
+pub const UDP_MAX_PAYLOAD_DEFAULT: usize = 61_440;
+
+/// Idle limit for a UDP association, in seconds.
+pub const UDP_ASSOCIATION_IDLE_SECS: u64 = 60;
+
+// ---------------------------------------------------------------------------
+// §7.5 flow-control and recovery budgets
+// ---------------------------------------------------------------------------
+
+/// Default per-stream flow-control window, in bytes.
+pub const FLOW_WINDOW_BYTES: u64 = kib64(256);
+
+/// Session-wide cap on unconsumed business bytes, in bytes.
+pub const SESSION_WINDOW_BYTES: u64 = kib64(8 * 1024);
+
+/// Per-session control queue reserve, in bytes.
+pub const CONTROL_QUEUE_BYTES: usize = kib(64);
+
+/// Fraction of unconsumed bytes that may be held out of order, in bytes.
+pub const REORDER_MAX_OUT_OF_ORDER_BYTES: usize = kib(128);
+
+/// Maximum number of out-of-order blocks held per direction.
+pub const REORDER_MAX_BLOCKS: usize = 128;
+
+/// Control-message delivery target, in milliseconds.
+pub const CONTROL_DELIVERY_TARGET_MS: u64 = 100;
+
+/// Progress coalescing interval, in milliseconds.
+pub const PROGRESS_COALESCE_MS: u64 = 50;
+
+/// Progress coalescing threshold, in bytes.
+pub const PROGRESS_COALESCE_BYTES: usize = kib(32);
+
+/// Minimum retransmit timeout, in milliseconds.
+pub const RETRANSMIT_TIMEOUT_MIN_MS: u64 = 500;
+
+/// Maximum retransmit timeout after backoff, in milliseconds.
+pub const RETRANSMIT_TIMEOUT_MAX_MS: u64 = 2_000;
+
+/// Maximum recovery sends of one block.
+pub const RETRANSMIT_MAX_ATTEMPTS: u32 = 3;
+
+/// Session keepalive interval, in seconds.
+pub const KEEPALIVE_INTERVAL_SECS: u64 = 20;
+
+/// Lower bound of the reconnect backoff range, in seconds.
+pub const RECONNECT_BACKOFF_MIN_SECS: u64 = 1;
+
+/// Upper bound of the reconnect backoff range, in seconds.
+pub const RECONNECT_BACKOFF_MAX_SECS: u64 = 30;
+
+/// Consecutive failed health checks before failing over to another Hub.
+pub const HEALTH_FAILURES_BEFORE_FAILOVER: u32 = 3;
+
+/// How long a recovered Hub must stay healthy before failing back, in seconds.
+pub const HEALTH_STABLE_BEFORE_FAILBACK_SECS: u64 = 30;
+
+
+// ---------------------------------------------------------------------------
 // Compile-time invariants
 // ---------------------------------------------------------------------------
 //
@@ -290,3 +400,25 @@ const _: () = assert!(MAX_UDP_PAYLOAD <= MAX_RECORD_PLAINTEXT);
 
 /// §7.5: the initial credit must not exceed the maximum window.
 const _: () = assert!(STREAM_INITIAL_CREDIT <= STREAM_MAX_CREDIT);
+
+/// §7.4: the queue TTL must sit inside its documented configurable range.
+const _: () = assert!(UDP_QUEUE_TTL_MIN_MS <= UDP_QUEUE_TTL_DEFAULT_MS);
+const _: () = assert!(UDP_QUEUE_TTL_DEFAULT_MS <= UDP_QUEUE_TTL_MAX_MS);
+
+/// §7.4: a default-sized UDP payload plus the largest SOCKS5 UDP header must
+/// still fit one record ("加 SOCKS 头不得超过 UDP/记录上限"). The domain-address
+/// header is 4 + 1 + 1 + 255 + 2 = 263 bytes, rounded up here.
+const _: () = assert!(UDP_MAX_PAYLOAD_DEFAULT + 264 <= MAX_UDP_PAYLOAD);
+
+/// §7.5: retransmit bounds must be ordered.
+const _: () = assert!(RETRANSMIT_TIMEOUT_MIN_MS <= RETRANSMIT_TIMEOUT_MAX_MS);
+
+/// §7.5: the per-stream window must fit inside the session-wide budget.
+const _: () = assert!(FLOW_WINDOW_BYTES <= SESSION_WINDOW_BYTES);
+
+/// §7.3: out-of-order data is a fraction of the flow window, not all of it.
+const _: () = assert!(REORDER_MAX_OUT_OF_ORDER_BYTES as u64 <= FLOW_WINDOW_BYTES);
+
+/// §6.7: reconnect backoff must be ordered.
+const _: () = assert!(RECONNECT_BACKOFF_MIN_SECS <= RECONNECT_BACKOFF_MAX_SECS);
+

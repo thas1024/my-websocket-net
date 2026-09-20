@@ -1,0 +1,22 @@
+﻿[package]
+name = "wsnetd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wsnet Hub daemon"
+publish = false
+
+[[bin]]
+name = "wsnetd"
+path = "src/main.rs"
+
+[dependencies]
+wsnet-hub.workspace = true
+wsnet-config.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

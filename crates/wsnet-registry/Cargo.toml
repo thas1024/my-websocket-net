@@ -1,0 +1,17 @@
+[package]
+name = "wsnet-registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wsnet Hub node leases and service directory (DESIGN.md §5.5, §7.6, §8)"
+
+[dependencies]
+wsnet-limits.workspace = true
+wsnet-routing.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

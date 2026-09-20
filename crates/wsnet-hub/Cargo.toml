@@ -1,0 +1,32 @@
+[package]
+name = "wsnet-hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wsnet Hub server: authentication, leases, relay, and HTTP/WS/SSE endpoints"
+
+[dependencies]
+wsnet-limits.workspace = true
+wsnet-protocol.workspace = true
+wsnet-crypto.workspace = true
+wsnet-auth-store.workspace = true
+wsnet-operation.workspace = true
+wsnet-stream.workspace = true
+wsnet-transport.workspace = true
+wsnet-routing.workspace = true
+wsnet-registry.workspace = true
+wsnet-site.workspace = true
+wsnet-config.workspace = true
+wsnet-session.workspace = true
+axum.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+serde.workspace = true
+hex.workspace = true
+sha2.workspace = true

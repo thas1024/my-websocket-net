@@ -8,6 +8,18 @@ members = [
     "crates/wsnet-operation",
     "crates/wsnet-stream",
     "crates/wsnet-transport",
+    "crates/wsnet-config",
+    "crates/wsnet-routing",
+    "crates/wsnet-registry",
+    "crates/wsnet-site",
+    "crates/wsnet-socks",
+    "crates/wsnet-forward",
+    "crates/wsnet-session",
+    "crates/wsnet-hub",
+    "crates/wsnet-node",
+    "crates/wsnet-control",
+    "bins/wsnetd",
+    "bins/wsnet",
 ]
 
 [workspace.package]
@@ -19,6 +31,7 @@ repository = "https://github.com/thas1024/my-websocket-net"
 description = "wsnet — hybrid-carrier lightweight proxy (design-stage implementation)"
 
 [workspace.dependencies]
+# workspace crates
 wsnet-limits = { path = "crates/wsnet-limits" }
 wsnet-protocol = { path = "crates/wsnet-protocol" }
 wsnet-crypto = { path = "crates/wsnet-crypto" }
@@ -26,10 +39,24 @@ wsnet-auth-store = { path = "crates/wsnet-auth-store" }
 wsnet-operation = { path = "crates/wsnet-operation" }
 wsnet-stream = { path = "crates/wsnet-stream" }
 wsnet-transport = { path = "crates/wsnet-transport" }
+wsnet-config = { path = "crates/wsnet-config" }
+wsnet-routing = { path = "crates/wsnet-routing" }
+wsnet-registry = { path = "crates/wsnet-registry" }
+wsnet-site = { path = "crates/wsnet-site" }
+wsnet-socks = { path = "crates/wsnet-socks" }
+wsnet-forward = { path = "crates/wsnet-forward" }
+wsnet-session = { path = "crates/wsnet-session" }
+wsnet-hub = { path = "crates/wsnet-hub" }
+wsnet-node = { path = "crates/wsnet-node" }
+wsnet-control = { path = "crates/wsnet-control" }
 
+# primitives
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["std"] }
 thiserror = "1"
+anyhow = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
 
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
@@ -41,8 +68,39 @@ rand = "0.8"
 
 hex = "0.4"
 base64 = "0.22"
+bytes = "1"
+futures-util = "0.3"
+ipnet = "2"
+url = "2"
+
+# async runtime and I/O
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+    "signal",
+    "fs",
+] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+axum = { version = "0.7", features = ["ws", "http1"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+    "stream",
+    "http2",
+] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = "0.23"
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"

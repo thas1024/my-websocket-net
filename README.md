@@ -1,31 +1,53 @@
 # wsnet
 
-**实现中：已完成 §4–§7 中不依赖 I/O 的部分，网络层尚未开始。** Rust 轻量代理，参考 [Xray-core](https://github.com/XTLS/Xray-core) 的职责分层，不声明线协议兼容或已验证抗封锁效果。
+**实现中：协议、加密、载体、SOCKS5、Local Forward、Hub 与节点均已落地并有测试；Hub 出站数据面与部分载体路径仍未实现。** Rust 轻量代理，参考 [Xray-core](https://github.com/XTLS/Xray-core) 的职责分层，不声明线协议兼容或已验证抗封锁效果。
 
 ## 当前实现状态
 
-已完成的部分全部有单元测试；**尚无任何网络层，因此当前还不能作为代理运行**。
-
 | crate | 对应设计 | 状态 |
 | --- | --- | --- |
-| `wsnet-limits` | §4.1 §5 §7.5 各项预算 | 完成；预算之间的关键关系为编译期断言，破坏即构建失败 |
-| `wsnet-protocol` | §4.1 canonical metadata、record framing | 完成；metadata 编解码为自实现，拒绝重复键/浮点/超 i64 整数，先限长再分配 |
-| `wsnet-crypto` | §4.2 §5.1 HKDF 方向密钥、nonce、AEAD 信封、HMAC 输入 | 完成；`PacketNo` 不透明，无法复用 nonce，且禁止回绕 |
-| `wsnet-auth-store` | §4.2 传输 replay 窗口、§5.1 nonce 登记 | 完成；持久化存储与多实例共享存储未接 |
+| `wsnet-limits` | §4.1 §5 §7.5 §9.2 各项预算 | 完成；预算之间的关键关系为编译期断言，破坏即构建失败 |
+| `wsnet-protocol` | §4.1 canonical metadata、record framing | 完成；metadata 编解码自实现，拒绝重复键/浮点/超 i64 整数，先限长再分配 |
+| `wsnet-crypto` | §4.2 §5.1 HKDF 方向密钥、nonce、AEAD 信封、HMAC | 完成；`PacketNo` 不透明，无法复用 nonce，且禁止回绕 |
+| `wsnet-auth-store` | §4.2 传输 replay 窗口、§5.1 nonce 登记 | 完成；持久化与多实例共享存储未接 |
 | `wsnet-operation` | §5.2 至多一次业务幂等表 | 完成 |
 | `wsnet-stream` | §7.3 有界重排、§7.5 字节 credit | 完成 |
 | `wsnet-transport` | §4.3 载体编码、§6.4 站点形态 | 完成（编解码层，无 I/O） |
-| `wsnet-socks`、`wsnet-forward`、`wsnet-routing`、`wsnet-registry`、`wsnet-site`、`wsnet-control` | §7–§9 §11 | **未开始** |
+| `wsnet-routing` | §7.1 §7.6 §9.3 destination union、路由、ACL | 完成 |
+| `wsnet-registry` | §5.5 §7.6 §8 node lease 与服务目录 | 完成 |
+| `wsnet-site` | §6.5 §9.1 正常站点与分阶段失败外观 | 完成 |
+| `wsnet-config` | §10 TOML schema 与校验 | 完成 |
+| `wsnet-session` | §4–§7 session 引擎：握手、sealing、replay、流多路复用、credit | 完成；载体无关，可在进程内两端对测 |
+| `wsnet-socks` | §7.4 §7.6 SOCKS5 TCP CONNECT 与 UDP ASSOCIATE | 完成 |
+| `wsnet-forward` | §7.6 Local Forward TCP/UDP 与生命周期 | 完成 |
+| `wsnet-control` | USAGE §1–§2 本地管理 IPC | 完成 |
+| `wsnet-node` | §5.3 §5.5 §6 节点客户端：SOCKS5、Local Forward、多 Hub 新连接转移 | **部分**：POST+SSE 载体已实现但未测；**WebSocket 载体未实现**；HTTP 载体尚未实现 §4.4 `BindProof`；UDP ASSOCIATE 未接；无重连退避监督 |
+| `wsnet-hub` | §4.3 §4.4 §5 §8 §9 §11 Hub 服务端 | **部分**：认证、BindProof、lease、ACL 与载体端点已实现；**出站数据面未实现**——通过授权的 `Open` 返回明确的 `OpenResult` 拒绝而非拨号 |
+| `wsnetd` / `wsnet` 二进制 | USAGE §2 | 完成：`wsnetd check/serve` 与 `wsnet check/run/status/services/forward/keygen` |
 
-已覆盖的验收项：**T01、T02、T03、T05、T08、T10**，以及 T18/T20 中属于解析器的部分；对照见 `crates/wsnet-transport/tests/acceptance.rs`。其余验收项需要真实 socket、TLS、nginx 与受控故障注入，属于后续工作。
+### 已知缺口（明确列出，避免把设计当成已实现）
+
+- **Hub 不拨号到目标**，因此当前无法端到端转发真实流量；这是最大的一处缺口。
+- **节点侧的绑定载体未实现 `BindProof`**：Hub 要求绑定后的每个 `/m`、`/e`、`/w` 请求携带 `BindProof`，节点仍使用自定义 `x-wsnet-session` 头。实测结果为：节点能完成认证并进入 `HelloPending`，但随后的 `Hello` 被 Hub 以站点失败外观拒绝，因此**到达 `Ready` 与注册仍未打通**。这是当前唯一剩下的控制面阻塞点。
+- 节点侧 WebSocket 载体、UDP ASSOCIATE、重连退避监督未实现。
+- `services list` 只报告本节点发布的条目：节点的 `ServiceDirectory` 只支持 `contains` 查询，不支持枚举，因此没有伪造远端目录列表。
+- 未做 nginx / TLS 实机验证；`wsnet-limits` 的 DoS 预算未压测。
+
+### 实测记录
+
+用真实二进制在 `127.0.0.1` 上跑通了：`wsnetd check/serve` 启动、`wsnet check/run` 连接、**`Auth`/`AuthOk` 握手成功并完成方向密钥派生**（日志 `wsnet hub session authenticated hub=hub-a`，随后 `Binding` → `HelloPending`）。这一路径调出了一个真实的对接缺陷：节点曾把 `Auth` 作为裸 canonical JSON 发送，而 Hub 按 §4.3 的载体分帧解码为 record，因此一律以站点 404 失败外观拒绝。已修复为「record + POST 载体分帧」，并同步修正了测试桩，使三处帧格式一致。
+
+> Windows 提示：配置里的路径若含反斜杠需写成 `C:/...` 或 TOML 字面串 `'C:\...'`，否则会被当作转义序列（`invalid unicode 8-digit hex code`）。
+
 
 构建与测试（Rust 1.75+；本仓库在 `x86_64-pc-windows-gnu` 上验证通过）：
 
 ```bash
-cargo test                                   # 200 个测试
-cargo clippy --all-targets -- -D warnings    # 无警告
+cargo test --workspace                      # 全部单元与集成测试
+cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release
 ```
+
 
 
 ## 计划能力

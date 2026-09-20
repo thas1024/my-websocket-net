@@ -95,7 +95,12 @@ impl Psk {
         Psk(bytes)
     }
 
-    pub(crate) fn as_bytes(&self) -> &[u8; PSK_LEN] {
+    /// The raw key bytes.
+    ///
+    /// Public because the handshake must key an HMAC before any session key
+    /// exists. It is named plainly so that every use is easy to find in review;
+    /// prefer passing the [`Psk`] itself wherever a function accepts one.
+    pub fn as_bytes(&self) -> &[u8; PSK_LEN] {
         &self.0
     }
 }

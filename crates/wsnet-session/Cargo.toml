@@ -1,0 +1,31 @@
+[package]
+name = "wsnet-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wsnet session engine: handshake, carriers, and stream multiplexing (DESIGN.md sections 4-7)"
+
+[dependencies]
+wsnet-limits.workspace = true
+wsnet-protocol.workspace = true
+wsnet-crypto.workspace = true
+wsnet-auth-store.workspace = true
+wsnet-operation.workspace = true
+wsnet-stream.workspace = true
+wsnet-transport.workspace = true
+wsnet-routing.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+base64.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

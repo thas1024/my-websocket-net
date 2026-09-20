@@ -1,0 +1,15 @@
+﻿[package]
+name = "wsnet-socks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wsnet SOCKS5 TCP CONNECT and UDP ASSOCIATE inbound (DESIGN.md §7.4, §7.6)"
+
+[dependencies]
+wsnet-limits.workspace = true
+wsnet-routing.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
