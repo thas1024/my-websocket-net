@@ -258,7 +258,10 @@ mod tests {
     fn debug_output_never_leaks_key_material() {
         let keys = SessionKeys::derive(&Psk::from_bytes([0xAB; PSK_LEN]), AUTH, AUTHOK);
         assert_eq!(format!("{keys:?}"), "SessionKeys(<redacted>)");
-        assert_eq!(format!("{:?}", Psk::from_bytes([0xAB; PSK_LEN])), "Psk(<redacted>)");
+        assert_eq!(
+            format!("{:?}", Psk::from_bytes([0xAB; PSK_LEN])),
+            "Psk(<redacted>)"
+        );
     }
 
     /// The transcript is order-sensitive: swapping the two halves must change it.

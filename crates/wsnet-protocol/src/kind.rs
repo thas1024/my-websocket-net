@@ -174,7 +174,10 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         for (i, kind) in MessageKind::ALL.iter().enumerate() {
             assert_eq!(kind.as_u8() as usize, i + 1, "{kind} moved");
-            assert!(seen.insert(kind.as_u8()), "duplicate discriminant for {kind}");
+            assert!(
+                seen.insert(kind.as_u8()),
+                "duplicate discriminant for {kind}"
+            );
         }
         assert_eq!(seen.len(), MessageKind::ALL.len());
     }

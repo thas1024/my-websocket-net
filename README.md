@@ -1,6 +1,32 @@
 # wsnet
 
-**设计阶段，尚未编码实现。** Rust 轻量代理，参考 [Xray-core](https://github.com/XTLS/Xray-core) 的职责分层，不声明线协议兼容或已验证抗封锁效果。
+**实现中：已完成 §4–§7 中不依赖 I/O 的部分，网络层尚未开始。** Rust 轻量代理，参考 [Xray-core](https://github.com/XTLS/Xray-core) 的职责分层，不声明线协议兼容或已验证抗封锁效果。
+
+## 当前实现状态
+
+已完成的部分全部有单元测试；**尚无任何网络层，因此当前还不能作为代理运行**。
+
+| crate | 对应设计 | 状态 |
+| --- | --- | --- |
+| `wsnet-limits` | §4.1 §5 §7.5 各项预算 | 完成；预算之间的关键关系为编译期断言，破坏即构建失败 |
+| `wsnet-protocol` | §4.1 canonical metadata、record framing | 完成；metadata 编解码为自实现，拒绝重复键/浮点/超 i64 整数，先限长再分配 |
+| `wsnet-crypto` | §4.2 §5.1 HKDF 方向密钥、nonce、AEAD 信封、HMAC 输入 | 完成；`PacketNo` 不透明，无法复用 nonce，且禁止回绕 |
+| `wsnet-auth-store` | §4.2 传输 replay 窗口、§5.1 nonce 登记 | 完成；持久化存储与多实例共享存储未接 |
+| `wsnet-operation` | §5.2 至多一次业务幂等表 | 完成 |
+| `wsnet-stream` | §7.3 有界重排、§7.5 字节 credit | 完成 |
+| `wsnet-transport` | §4.3 载体编码、§6.4 站点形态 | 完成（编解码层，无 I/O） |
+| `wsnet-socks`、`wsnet-forward`、`wsnet-routing`、`wsnet-registry`、`wsnet-site`、`wsnet-control` | §7–§9 §11 | **未开始** |
+
+已覆盖的验收项：**T01、T02、T03、T05、T08、T10**，以及 T18/T20 中属于解析器的部分；对照见 `crates/wsnet-transport/tests/acceptance.rs`。其余验收项需要真实 socket、TLS、nginx 与受控故障注入，属于后续工作。
+
+构建与测试（Rust 1.75+；本仓库在 `x86_64-pc-windows-gnu` 上验证通过）：
+
+```bash
+cargo test                                   # 200 个测试
+cargo clippy --all-targets -- -D warnings    # 无警告
+cargo build --release
+```
+
 
 ## 计划能力
 

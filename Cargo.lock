@@ -367,8 +367,12 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "thiserror",
+ "wsnet-auth-store",
+ "wsnet-crypto",
  "wsnet-limits",
+ "wsnet-operation",
  "wsnet-protocol",
+ "wsnet-stream",
 ]
 
 [[package]]

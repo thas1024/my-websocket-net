@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "wsnet-transport"
 version.workspace = true
 edition.workspace = true
@@ -12,3 +12,10 @@ wsnet-limits.workspace = true
 wsnet-protocol.workspace = true
 base64.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+wsnet-crypto.workspace = true
+wsnet-auth-store.workspace = true
+wsnet-operation.workspace = true
+wsnet-stream.workspace = true
+

@@ -121,10 +121,7 @@ impl ReplayWindow {
             }
             Some(highest) => {
                 if highest - packet_no >= REPLAY_WINDOW {
-                    return Err(ReplayError::TooOld {
-                        packet_no,
-                        highest,
-                    });
+                    return Err(ReplayError::TooOld { packet_no, highest });
                 }
                 let (word, mask) = Self::locate(packet_no);
                 if self.seen[word] & mask != 0 {
@@ -213,10 +210,7 @@ mod tests {
         // None of them may be accepted a second time.
         for n in [90u64, 95, 99, 91, 0, 50, 100] {
             assert!(
-                matches!(
-                    window.check_and_record(n),
-                    Err(ReplayError::Duplicate(_))
-                ),
+                matches!(window.check_and_record(n), Err(ReplayError::Duplicate(_))),
                 "packet {n} was accepted twice"
             );
         }
@@ -299,7 +293,9 @@ mod tests {
         let mut window = ReplayWindow::new();
         window.check_and_record(10).unwrap();
         let before = window.clone();
-        assert!(window.check_and_record(10 + REPLAY_MAX_FORWARD_JUMP + 1).is_err());
+        assert!(window
+            .check_and_record(10 + REPLAY_MAX_FORWARD_JUMP + 1)
+            .is_err());
         assert_eq!(window.highest(), before.highest());
         assert_eq!(window.seen, before.seen);
     }

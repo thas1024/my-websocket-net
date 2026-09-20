@@ -158,7 +158,9 @@ mod tests {
 
     #[test]
     fn verification_accepts_the_correct_tag() {
-        let fields = SignedFields::new().push_str("client-a").push_u64(1_700_000_000);
+        let fields = SignedFields::new()
+            .push_str("client-a")
+            .push_u64(1_700_000_000);
         let tag = psk_mac(&psk(), &fields);
         assert!(verify_psk_mac(&psk(), &fields, &tag));
     }
@@ -170,7 +172,10 @@ mod tests {
         for i in 0..MAC_LEN {
             let original = tag[i];
             tag[i] ^= 0x01;
-            assert!(!verify_psk_mac(&psk(), &fields, &tag), "byte {i} not covered");
+            assert!(
+                !verify_psk_mac(&psk(), &fields, &tag),
+                "byte {i} not covered"
+            );
             tag[i] = original;
         }
     }

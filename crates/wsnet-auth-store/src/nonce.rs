@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use wsnet_limits::{
-    AUTH_NONCE_ENTRY_COST, AUTH_NONCE_MEMORY_BUDGET, AUTH_NONCE_PER_NODE_MAX, AUTH_NONCE_LEN,
+    AUTH_NONCE_ENTRY_COST, AUTH_NONCE_LEN, AUTH_NONCE_MEMORY_BUDGET, AUTH_NONCE_PER_NODE_MAX,
     AUTH_WINDOW_DEFAULT_SECS, AUTH_WINDOW_MAX_SECS, AUTH_WINDOW_MIN_SECS,
 };
 
@@ -238,12 +238,7 @@ impl NonceStore {
     /// (§5.1: "先限流/限长、校验字段和 HMAC，再在 ... 上原子查重并登记").
     ///
     /// A concurrent duplicate loses here: exactly one caller observes `Ok`.
-    pub fn register(
-        &mut self,
-        key: NonceKey,
-        ts: i64,
-        now: Now,
-    ) -> Result<(), AuthStoreError> {
+    pub fn register(&mut self, key: NonceKey, ts: i64, now: Now) -> Result<(), AuthStoreError> {
         if !self.timestamp_acceptable(ts, now.wall_secs) {
             return Err(AuthStoreError::TimestampOutOfWindow {
                 ts,
@@ -294,7 +289,9 @@ impl NonceStore {
         // timestamp would still be acceptable, measured monotonically.
         let last_acceptable_wall = ts.saturating_add(self.config.window_secs as i64);
         let delta_secs = (last_acceptable_wall + 1 - now.wall_secs).max(0) as u64;
-        let retain_until_ms = now.monotonic_ms.saturating_add(delta_secs.saturating_mul(1_000));
+        let retain_until_ms = now
+            .monotonic_ms
+            .saturating_add(delta_secs.saturating_mul(1_000));
 
         self.entries.insert(
             key,
@@ -317,7 +314,11 @@ impl NonceStore {
             if entry.retain_until_ms <= now.monotonic_ms {
                 let node_key = (key.hub_id.clone(), key.node_id.clone());
                 // Read-then-write keeps this free of overlapping borrows.
-                let remaining = per_node.get(&node_key).copied().unwrap_or(0).saturating_sub(1);
+                let remaining = per_node
+                    .get(&node_key)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(1);
                 if remaining == 0 {
                     per_node.remove(&node_key);
                 } else {
@@ -623,7 +624,8 @@ mod tests {
         // Restart 100s later: the record is still inside its window.
         let restarted_at = Now::new(1_100, 5_000);
         let mut restored =
-            NonceStore::restore(NonceStoreConfig::default(), snapshot.clone(), restarted_at).unwrap();
+            NonceStore::restore(NonceStoreConfig::default(), snapshot.clone(), restarted_at)
+                .unwrap();
         assert_eq!(
             restored.register(key(1), 1_000, restarted_at).unwrap_err(),
             AuthStoreError::Duplicate

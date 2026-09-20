@@ -240,53 +240,53 @@ pub const BACKGROUND_MAX_PER_SESSION: usize = 1;
 /// Global background-request bandwidth budget, in bytes per second.
 pub const BACKGROUND_BUDGET_BYTES_PER_SEC: usize = kib(4);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// ---------------------------------------------------------------------------
+// Compile-time invariants
+// ---------------------------------------------------------------------------
+//
+// These are `const` assertions rather than `#[test]`s on purpose: each one is a
+// relationship between two of the budgets above, so a future edit that breaks it
+// should fail the build for everyone, not only fail `cargo test`.
 
-    /// §4.2: the scheduler must not be able to push valid control records out of
-    /// the replay window, so in-flight records must fit strictly inside it.
-    #[test]
-    fn in_flight_budget_fits_inside_replay_window() {
-        assert!(MAX_IN_FLIGHT_RECORDS < REPLAY_WINDOW);
-    }
+/// §4.2: the scheduler must not be able to push valid control records out of the
+/// replay window, so in-flight sealed records must fit strictly inside it.
+const _: () = assert!(MAX_IN_FLIGHT_RECORDS < REPLAY_WINDOW);
 
-    /// §4.1: payload + metadata + padding must be representable inside a record.
-    #[test]
-    fn record_bounds_are_consistent() {
-        let worst_case = MAX_TCP_PAYLOAD + MAX_METADATA + MAX_PADDING + 32;
-        assert!(
-            worst_case <= MAX_RECORD_PLAINTEXT,
-            "worst-case record {worst_case} exceeds MAX_RECORD_PLAINTEXT"
-        );
-    }
+/// §4.1: the worst-case record (maximum payload, metadata, and padding, plus the
+/// longest plausible integer metadata) must still fit one record plaintext.
+const _: () = assert!(MAX_TCP_PAYLOAD + MAX_METADATA + MAX_PADDING + 64 <= MAX_RECORD_PLAINTEXT);
 
-    /// §4.3 bounds one POST batch by *both* a record count and a decoded byte
-    /// total ("每批解码后不超过 256 KiB、至多 64 记录"). A 64-record batch of
-    /// maximum-size records therefore does not fit, and that is intended: the
-    /// byte total binds for large records, the count binds for small ones, and a
-    /// parser must apply both checks rather than assume either one implies the
-    /// other.
-    #[test]
-    fn post_batch_bounds_are_consistent() {
-        assert!(MAX_POST_BATCH_BYTES <= MAX_HTTP_BODY);
-        // At least one maximum-size record must fit, or the byte cap would make
-        // the carrier unable to carry the largest legal record.
-        assert!(MAX_POST_BATCH_BYTES >= MAX_CARRIER_RECORD);
-        // The two caps are genuinely independent.
-        assert!(MAX_POST_BATCH_RECORDS * MAX_CARRIER_RECORD > MAX_POST_BATCH_BYTES);
-        // The per-record cap inside a full batch is only a quarter of a record.
-        assert_eq!(
-            MAX_POST_BATCH_BYTES / MAX_POST_BATCH_RECORDS,
-            kib(4),
-            "a full 64-record batch can only afford 4 KiB per record"
-        );
-    }
+/// §4.2: a counter may only be allocated below the ceiling.
+const _: () = assert!(PACKET_NO_EXHAUSTION_MARGIN > 0);
 
-    /// §5.1: the auth window must stay inside the documented configurable range.
-    #[test]
-    fn auth_window_default_is_in_range() {
-        assert!(AUTH_WINDOW_DEFAULT_SECS >= AUTH_WINDOW_MIN_SECS);
-        assert!(AUTH_WINDOW_DEFAULT_SECS <= AUTH_WINDOW_MAX_SECS);
-    }
-}
+/// §4.3: an encoded carrier body can never exceed the HTTP body bound.
+const _: () = assert!(MAX_POST_BATCH_BYTES <= MAX_HTTP_BODY);
+
+/// §4.3: the byte cap must still admit the largest legal record, or the carrier
+/// could not carry it at all.
+const _: () = assert!(MAX_POST_BATCH_BYTES >= MAX_CARRIER_RECORD);
+
+/// §4.3: the record count and the byte total are *independent* caps. A 64-record
+/// batch of maximum-size records deliberately does not fit — the byte total
+/// binds for large records, the count binds for small ones, and a parser must
+/// apply both rather than assume either implies the other.
+const _: () = assert!(MAX_POST_BATCH_RECORDS * MAX_CARRIER_RECORD > MAX_POST_BATCH_BYTES);
+
+/// The per-record allowance inside a full 64-record batch.
+const _: () = assert!(MAX_POST_BATCH_BYTES / MAX_POST_BATCH_RECORDS == kib(4));
+
+/// §5.1: the default auth window must sit inside the documented range.
+const _: () = assert!(AUTH_WINDOW_DEFAULT_SECS >= AUTH_WINDOW_MIN_SECS);
+const _: () = assert!(AUTH_WINDOW_DEFAULT_SECS <= AUTH_WINDOW_MAX_SECS);
+
+/// §5.1: the nonce memory budget must admit at least one node's worth of records.
+const _: () = assert!(AUTH_NONCE_MEMORY_BUDGET / AUTH_NONCE_ENTRY_COST >= AUTH_NONCE_PER_NODE_MAX);
+
+/// §6.4: the background-request jitter range must be ordered.
+const _: () = assert!(BACKGROUND_JITTER_MIN_SECS <= BACKGROUND_JITTER_MAX_SECS);
+
+/// §7.4: a single UDP payload must fit one record after framing.
+const _: () = assert!(MAX_UDP_PAYLOAD <= MAX_RECORD_PLAINTEXT);
+
+/// §7.5: the initial credit must not exceed the maximum window.
+const _: () = assert!(STREAM_INITIAL_CREDIT <= STREAM_MAX_CREDIT);

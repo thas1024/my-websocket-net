@@ -176,7 +176,8 @@ impl Canonical {
     /// Reads a field that must be a decimal-encoded unsigned integer.
     pub fn get_u64(&self, key: &'static str) -> Result<u64, CanonError> {
         let raw = self.get_str(key)?;
-        raw.parse::<u64>().map_err(|_| CanonError::NotDecimal(key.into()))
+        raw.parse::<u64>()
+            .map_err(|_| CanonError::NotDecimal(key.into()))
     }
 
     /// Reads a field that must be an `i64` integer.
@@ -350,9 +351,7 @@ impl<'a> Parser<'a> {
     }
 
     fn bump(&mut self) -> Result<u8, CanonError> {
-        let byte = self
-            .peek()
-            .ok_or(CanonError::UnexpectedEnd(self.pos))?;
+        let byte = self.peek().ok_or(CanonError::UnexpectedEnd(self.pos))?;
         self.pos += 1;
         Ok(byte)
     }
@@ -528,8 +527,9 @@ impl<'a> Parser<'a> {
             .parse::<i128>()
             .map_err(|_| CanonError::IntegerTooLarge(text.to_string()))?;
         let signed = if negative { -magnitude } else { magnitude };
-        let value = i64::try_from(signed)
-            .map_err(|_| CanonError::IntegerTooLarge(format!("{}{text}", if negative { "-" } else { "" })))?;
+        let value = i64::try_from(signed).map_err(|_| {
+            CanonError::IntegerTooLarge(format!("{}{text}", if negative { "-" } else { "" }))
+        })?;
         Ok(Canonical::Int(value))
     }
 
@@ -724,7 +724,10 @@ mod tests {
     #[test]
     fn depth_limit_is_enforced_without_stack_growth() {
         let deep = "[".repeat(MAX_CANON_DEPTH + 1);
-        assert_eq!(Canonical::from_bytes(deep.as_bytes()).unwrap_err(), CanonError::TooDeep);
+        assert_eq!(
+            Canonical::from_bytes(deep.as_bytes()).unwrap_err(),
+            CanonError::TooDeep
+        );
 
         let ok = "[".repeat(MAX_CANON_DEPTH) + &"]".repeat(MAX_CANON_DEPTH);
         assert!(Canonical::from_bytes(ok.as_bytes()).is_ok());
@@ -804,7 +807,8 @@ mod tests {
     #[test]
     fn try_object_rejects_duplicates() {
         assert_eq!(
-            Canonical::try_object([("a", Canonical::int(1)), ("a", Canonical::int(2))]).unwrap_err(),
+            Canonical::try_object([("a", Canonical::int(1)), ("a", Canonical::int(2))])
+                .unwrap_err(),
             CanonError::DuplicateKey("a".into())
         );
     }

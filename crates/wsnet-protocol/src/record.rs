@@ -137,8 +137,9 @@ impl Record {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
         let metadata = self.metadata.to_bounded_bytes()?;
         self.validate_against(&metadata)?;
-        let mut out =
-            Vec::with_capacity(RECORD_OVERHEAD + metadata.len() + self.payload.len() + self.padding_len as usize);
+        let mut out = Vec::with_capacity(
+            RECORD_OVERHEAD + metadata.len() + self.payload.len() + self.padding_len as usize,
+        );
         self.encode_into(&metadata, &mut out);
         Ok(out)
     }
@@ -183,7 +184,9 @@ impl Record {
         }
 
         let mut cursor = 0usize;
-        let kind_byte = *input.get(cursor).ok_or(RecordError::Truncated { field: "kind" })?;
+        let kind_byte = *input
+            .get(cursor)
+            .ok_or(RecordError::Truncated { field: "kind" })?;
         cursor += 1;
         let kind = MessageKind::from_u8(kind_byte).ok_or(RecordError::UnknownKind(kind_byte))?;
 
@@ -242,7 +245,9 @@ fn take<'a>(
     let end = cursor
         .checked_add(len)
         .ok_or(RecordError::Truncated { field })?;
-    let slice = input.get(*cursor..end).ok_or(RecordError::Truncated { field })?;
+    let slice = input
+        .get(*cursor..end)
+        .ok_or(RecordError::Truncated { field })?;
     *cursor = end;
     Ok(slice)
 }
@@ -304,7 +309,8 @@ mod tests {
 
     #[test]
     fn payload_is_rejected_for_metadata_only_kinds() {
-        let record = Record::with_payload(MessageKind::Ping, Canonical::empty_object(), vec![1, 2, 3]);
+        let record =
+            Record::with_payload(MessageKind::Ping, Canonical::empty_object(), vec![1, 2, 3]);
         assert_eq!(
             record.encode().unwrap_err(),
             RecordError::PayloadTooLarge {

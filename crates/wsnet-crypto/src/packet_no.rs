@@ -113,9 +113,12 @@ impl PacketNoAllocator {
         loop {
             if current == EXHAUSTED || current > PACKET_NO_CEILING {
                 // Latch the terminal state so later callers fail fast.
-                let _ = self
-                    .next
-                    .compare_exchange(current, EXHAUSTED, Ordering::AcqRel, Ordering::Acquire);
+                let _ = self.next.compare_exchange(
+                    current,
+                    EXHAUSTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 return Err(PacketNoError::Exhausted);
             }
             // `current <= PACKET_NO_CEILING < u64::MAX`, so this cannot overflow.
@@ -206,7 +209,10 @@ mod tests {
     #[test]
     fn ceiling_is_enforced_and_never_wraps() {
         let alloc = PacketNoAllocator::new();
-        assert_eq!(alloc.reserve_exact(PACKET_NO_CEILING).unwrap().get(), PACKET_NO_CEILING);
+        assert_eq!(
+            alloc.reserve_exact(PACKET_NO_CEILING).unwrap().get(),
+            PACKET_NO_CEILING
+        );
         assert_eq!(alloc.allocate().unwrap_err(), PacketNoError::Exhausted);
         assert_eq!(alloc.allocate().unwrap_err(), PacketNoError::Exhausted);
         assert!(alloc.is_exhausted());
@@ -216,7 +222,10 @@ mod tests {
             alloc.reserve_exact(PACKET_NO_CEILING + 1).unwrap_err(),
             PacketNoError::Exhausted
         );
-        assert_eq!(alloc.reserve_exact(0).unwrap_err(), PacketNoError::Exhausted);
+        assert_eq!(
+            alloc.reserve_exact(0).unwrap_err(),
+            PacketNoError::Exhausted
+        );
     }
 
     #[test]

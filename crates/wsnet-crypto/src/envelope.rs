@@ -60,7 +60,11 @@ pub struct EnvelopeContext {
 
 impl EnvelopeContext {
     /// Builds a context.
-    pub fn new(hub_id: impl Into<String>, session_id: [u8; 16], session_epoch: [u8; SESSION_EPOCH_LEN]) -> Self {
+    pub fn new(
+        hub_id: impl Into<String>,
+        session_id: [u8; 16],
+        session_epoch: [u8; SESSION_EPOCH_LEN],
+    ) -> Self {
         EnvelopeContext {
             hub_id: hub_id.into(),
             session_id,
@@ -326,8 +330,14 @@ mod tests {
     /// Distinct hub ids of different lengths must not collide in the AAD.
     #[test]
     fn aad_length_prefixing_is_unambiguous() {
-        let a = build_aad(&EnvelopeContext::new("ab", [1u8; 16], [2u8; 16]), Direction::ClientToServer);
-        let b = build_aad(&EnvelopeContext::new("a", [0xb1u8; 16], [2u8; 16]), Direction::ClientToServer);
+        let a = build_aad(
+            &EnvelopeContext::new("ab", [1u8; 16], [2u8; 16]),
+            Direction::ClientToServer,
+        );
+        let b = build_aad(
+            &EnvelopeContext::new("a", [0xb1u8; 16], [2u8; 16]),
+            Direction::ClientToServer,
+        );
         assert_ne!(a, b);
     }
 
@@ -386,10 +396,27 @@ mod tests {
     #[test]
     fn each_packet_no_produces_a_distinct_envelope() {
         let a = alloc();
-        let first = seal(&KEY, &ctx(), Direction::ClientToServer, a.allocate().unwrap(), b"same").unwrap();
-        let second = seal(&KEY, &ctx(), Direction::ClientToServer, a.allocate().unwrap(), b"same").unwrap();
+        let first = seal(
+            &KEY,
+            &ctx(),
+            Direction::ClientToServer,
+            a.allocate().unwrap(),
+            b"same",
+        )
+        .unwrap();
+        let second = seal(
+            &KEY,
+            &ctx(),
+            Direction::ClientToServer,
+            a.allocate().unwrap(),
+            b"same",
+        )
+        .unwrap();
         assert_ne!(first, second);
-        assert_ne!(&first[ENVELOPE_HEADER_LEN..], &second[ENVELOPE_HEADER_LEN..]);
+        assert_ne!(
+            &first[ENVELOPE_HEADER_LEN..],
+            &second[ENVELOPE_HEADER_LEN..]
+        );
     }
 
     #[test]
