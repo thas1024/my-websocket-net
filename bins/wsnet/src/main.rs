@@ -160,9 +160,10 @@ async fn run(path: &Path) -> anyhow::Result<()> {
     let config =
         ClientConfig::load_from_path(path).with_context(|| format!("loading {}", path.display()))?;
 
-    // The control handler needs the configured forward list, so keep a copy
-    // before the node takes ownership of the configuration.
+    // The control handler needs the configured forward and service lists, so
+    // keep a copy before the node takes ownership of the configuration.
     let forwards = config.forwards.clone();
+    let services = config.services.clone();
     let node_id = config.client.node_id.clone();
 
     let options = NodeOptions::default();
@@ -186,6 +187,7 @@ async fn run(path: &Path) -> anyhow::Result<()> {
         node_id,
         started: Instant::now(),
         forwards,
+        services,
         requests: AtomicU64::new(0),
     };
 
@@ -342,6 +344,7 @@ struct Handler {
     node_id: String,
     started: Instant,
     forwards: Vec<wsnet_config::ForwardConfig>,
+    services: Vec<wsnet_config::ServiceConfig>,
     requests: AtomicU64,
 }
 
@@ -375,7 +378,7 @@ impl Handler {
             counters: Counters {
                 streams_open: 0,
                 forwards_active: active,
-                services_published: self.forwards.len() as u64,
+                services_published: self.services.len() as u64,
                 control_requests: self.requests.load(Ordering::Relaxed),
                 ..Counters::default()
             },
@@ -409,22 +412,27 @@ impl Handler {
             .collect()
     }
 
+    /// The services this node publishes, as configured.
+    ///
+    /// The node crate's `ServiceDirectory` answers membership queries but cannot
+    /// enumerate a remote directory, so a remote listing is not faked here. What
+    /// this reports is exactly what the node registered in its `Hello`.
     fn services(&self) -> Vec<ServiceDescriptor> {
-        self.forwards
+        let hub = self
+            .node
+            .hub_ids()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "local".to_string());
+        self.services
             .iter()
-            .filter_map(|forward| {
-                let destination = forward.destination.as_ref()?;
-                Some(ServiceDescriptor {
-                    hub: forward.hub.clone(),
-                    node: destination
-                        .named_node()
-                        .unwrap_or(&self.node_id)
-                        .to_string(),
-                    name: forward.name.clone(),
-                    proto: forward.proto,
-                    revision: 0,
-                    state: ServiceState::Ready,
-                })
+            .map(|service| ServiceDescriptor {
+                hub: hub.clone(),
+                node: self.node_id.clone(),
+                name: service.name.clone(),
+                proto: service.proto,
+                revision: 0,
+                state: ServiceState::Ready,
             })
             .collect()
     }

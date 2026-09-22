@@ -149,13 +149,14 @@ impl HubSession {
         // Section 6.7: a response for a losing candidate must not become the
         // owner of this session.
         let authok = verify_authok(&psk, &auth.attempt_id, &offered_mac, &reply.metadata)?;
+        let keys = session_keys(&psk, &auth, &authok);
         let bound = BoundSession {
             hub_id: endpoint.hub_id.clone(),
             node_id: node_id.clone(),
             session_id: authok.session_id,
             session_epoch: authok.session_epoch,
+            bind_key: *keys.bind_key(),
         };
-        let keys = session_keys(&psk, &auth, &authok);
         let config = SessionConfig::new(
             endpoint.hub_id.clone(),
             node_id,

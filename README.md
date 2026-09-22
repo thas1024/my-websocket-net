@@ -27,15 +27,20 @@
 
 ### 已知缺口（明确列出，避免把设计当成已实现）
 
-- **Hub 不拨号到目标**，因此当前无法端到端转发真实流量；这是最大的一处缺口。
-- **节点侧的绑定载体未实现 `BindProof`**：Hub 要求绑定后的每个 `/m`、`/e`、`/w` 请求携带 `BindProof`，节点仍使用自定义 `x-wsnet-session` 头。实测结果为：节点能完成认证并进入 `HelloPending`，但随后的 `Hello` 被 Hub 以站点失败外观拒绝，因此**到达 `Ready` 与注册仍未打通**。这是当前唯一剩下的控制面阻塞点。
-- 节点侧 WebSocket 载体、UDP ASSOCIATE、重连退避监督未实现。
+- **Hub 出站只实现了 `HubExit`**：地址型目标会真正解析、按 §9.3 校验每个候选 IP、拨号并双向搬运字节。`ServiceExit`、`NodeExit` 与多跳 `Relay` 仍以带明确原因的 `OpenResult` 拒绝——它们需要发布方节点终止该 leg，属于反向服务路径。
+- **节点侧没有 WebSocket 载体**（上行 POST + 下行 SSE），UDP ASSOCIATE 与重连退避监督未实现。
 - `services list` 只报告本节点发布的条目：节点的 `ServiceDirectory` 只支持 `contains` 查询，不支持枚举，因此没有伪造远端目录列表。
 - 未做 nginx / TLS 实机验证；`wsnet-limits` 的 DoS 预算未压测。
 
 ### 实测记录
 
-用真实二进制在 `127.0.0.1` 上跑通了：`wsnetd check/serve` 启动、`wsnet check/run` 连接、**`Auth`/`AuthOk` 握手成功并完成方向密钥派生**（日志 `wsnet hub session authenticated hub=hub-a`，随后 `Binding` → `HelloPending`）。这一路径调出了一个真实的对接缺陷：节点曾把 `Auth` 作为裸 canonical JSON 发送，而 Hub 按 §4.3 的载体分帧解码为 record，因此一律以站点 404 失败外观拒绝。已修复为「record + POST 载体分帧」，并同步修正了测试桩，使三处帧格式一致。
+**端到端验收已跑通**（`crates/wsnet-node/tests/end_to_end.rs`）：真实 Hub + 真实节点 + 真实 SOCKS5 客户端，断言 SOCKS5 客户端写入的字节经 node → Hub → 目标 socket 回显，并验证同一会话上连续三次请求都成功。
+
+控制面同样实测通过：`wsnetd serve` + `wsnet run`，日志显示 `Auth`/`AuthOk` 握手、方向密钥派生、`Binding → HelloPending → Ready`，`wsnet status` 显示 `hub-a Ready`，`wsnet services list` 显示已发布服务。
+
+这一路径调出并修掉了一个真实对接缺陷：节点曾把 `Auth` 作为裸 canonical JSON 发送，而 Hub 按 §4.3 的载体分帧解码为 record，因此一律被站点 404 失败外观拒绝（按 §9.1 该外观不带原因，日志里看不出所以然）。此外节点侧原先完全没有实现 §4.4 的 `BindProof`，`Hello` 永远过不去；现已按共享的签名输入实现。
+
+Hub 出站初版落地后，其自带的 4 个 dataplane 单测**当前是失败的**（等待会话事件超时），而走真实载体的端到端验收是通过的——即被测功能可用，是那 4 个单测的驱动脚手架有问题，仍待修。
 
 > Windows 提示：配置里的路径若含反斜杠需写成 `C:/...` 或 TOML 字面串 `'C:\...'`，否则会被当作转义序列（`invalid unicode 8-digit hex code`）。
 

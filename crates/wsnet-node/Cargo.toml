@@ -30,3 +30,9 @@ thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 hex.workspace = true
+
+[dev-dependencies]
+# The end-to-end acceptance test runs a real Hub in-process against a real node,
+# so the two halves are exercised over actual HTTP/SSE rather than a stub.
+wsnet-hub.workspace = true
+

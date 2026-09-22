@@ -14,6 +14,7 @@
 //! one carrier is not *lost* for the others; delivery is not confirmation anyway
 //! (section 7.3), and the receiver's replay window (section 4.2) drops duplicates.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -55,6 +56,14 @@ pub(crate) struct SessionEntry {
 struct Pump {
     events: mpsc::UnboundedReceiver<SessionEvent>,
     outbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// One event sink per live stream task, keyed by stream id.
+    ///
+    /// Section 7.1 gives every leg of a stream its own local mapping, so the
+    /// engine's events have to reach the task that owns the target socket rather
+    /// than the session's business logic. Section 8 is why this table exists at
+    /// all: an unknown stream is refused, so the table is also the authority on
+    /// which stream ids are live.
+    streams: HashMap<u64, mpsc::UnboundedSender<SessionEvent>>,
     /// Generation counter for SSE ownership.
     next_sse_generation: u64,
     /// The generation that currently owns the single SSE subscription (4.4).
@@ -86,6 +95,7 @@ impl SessionEntry {
             pump: Mutex::new(Pump {
                 events: session.events,
                 outbound: session.outbound,
+                streams: HashMap::new(),
                 next_sse_generation: 0,
                 sse_owner: None,
             }),
@@ -118,6 +128,54 @@ impl SessionEntry {
         let pump = self.pump.lock().expect("pump mutex");
         pump.sse_owner == Some(generation)
     }
+
+    /// Claims one stream id for a stream task, and reports whether it was free.
+    ///
+    /// Section 4.2 forbids reusing a stream id, so a second task for the same id
+    /// would be a second dial for one stream; the caller must refuse instead.
+    pub(crate) fn claim_stream(&self, stream_id: u64, sink: mpsc::UnboundedSender<SessionEvent>) -> bool {
+        let mut pump = self.pump.lock().expect("pump mutex");
+        if pump.streams.contains_key(&stream_id) {
+            return false;
+        }
+        pump.streams.insert(stream_id, sink);
+        true
+    }
+
+    /// Forgets a stream task's sink once the stream is over.
+    pub(crate) fn unregister_stream(&self, stream_id: u64) {
+        self.pump
+            .lock()
+            .expect("pump mutex")
+            .streams
+            .remove(&stream_id);
+    }
+
+    /// Hands one engine event to the stream task that owns it.
+    ///
+    /// `false` means no task owns this stream, which section 8 makes an explicit
+    /// refusal rather than something to create on demand.
+    pub(crate) fn route_stream_event(&self, stream_id: u64, event: SessionEvent) -> bool {
+        let pump = self.pump.lock().expect("pump mutex");
+        match pump.streams.get(&stream_id) {
+            Some(sink) => sink.send(event).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Drops every stream task's sink, which ends the task and frees its socket.
+    ///
+    /// Section 5.3 makes an unreachable peer's resources the local side's
+    /// problem, so tearing a session down must not leave an egress socket
+    /// behind; a task whose sink is gone sees the channel close and returns.
+    pub(crate) fn close_streams(&self) {
+        self.pump.lock().expect("pump mutex").streams.clear();
+    }
+
+    /// Number of live stream tasks, for diagnostics and tests.
+    pub(crate) fn live_streams(&self) -> usize {
+        self.pump.lock().expect("pump mutex").streams.len()
+    }
 }
 
 /// What one pump round did, so the caller can pump until quiescent.
@@ -131,15 +189,29 @@ impl SessionEntry {
     /// returns the events that need arbitrating.
     pub(crate) fn drain(&self) -> PumpRound {
         let mut pump = self.pump.lock().expect("pump mutex");
-        while let Ok(envelope) = pump.outbound.try_recv() {
-            // A send error only means no carrier is subscribed just now.
-            let _ = self.downlink.send(envelope);
-        }
+        Self::flush_locked(&self.downlink, &mut pump);
         let mut events = Vec::new();
         while let Ok(event) = pump.events.try_recv() {
             events.push(event);
         }
         PumpRound { events }
+    }
+
+    /// Moves queued envelopes to the downlink fan-out without touching events.
+    ///
+    /// A stream task produces work outside the session's carrier loop, so it has
+    /// to be able to publish its own records; section 6.2's fan-out is what makes
+    /// that safe, because every carrier keeps its own cursor.
+    pub(crate) fn flush_outbound(&self) {
+        let mut pump = self.pump.lock().expect("pump mutex");
+        Self::flush_locked(&self.downlink, &mut pump);
+    }
+
+    fn flush_locked(downlink: &broadcast::Sender<Vec<u8>>, pump: &mut Pump) {
+        while let Ok(envelope) = pump.outbound.try_recv() {
+            // A send error only means no carrier is subscribed just now.
+            let _ = downlink.send(envelope);
+        }
     }
 
     /// Whether the engine still needs arbitrating after a drain.
@@ -156,6 +228,7 @@ impl core::fmt::Debug for SessionEntry {
             .field("node_id", &self.node_id)
             .field("key_id", &self.key_id)
             .field("state", &self.handle.state())
+            .field("streams", &self.handle.stream_count())
             .field("closed", &self.is_closed())
             .finish()
     }

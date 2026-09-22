@@ -17,11 +17,13 @@
 //! # Why the egress plan is separate from the dial
 //!
 //! `authorize_open` stops at an [`ExitPlan`]: the exact leg an `Open` resolved to.
-//! Turning a plan into sockets is the Hub's data plane, which this build does not
-//! implement. Keeping the two apart means the *decision* is complete and testable
-//! (including section 7.6's service resolution and section 7.1's chain checks),
-//! and the unimplemented part is reported as a refusal that names itself instead
-//! of being hidden behind a silent success.
+//! Turning a plan into sockets is the Hub's data plane, which implements the
+//! Hub-exit leg only. Keeping the two apart means the
+//! *decision* is complete and testable (including section 7.6's service
+//! resolution and section 7.1's chain checks), the dial can block without
+//! blocking the decision, and the legs this build does not implement are
+//! reported as a refusal that names itself instead of being hidden behind a
+//! silent success.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -41,12 +43,14 @@ use wsnet_routing::{validate_chain, AclQuery, AclTable, Destination, RelayAllow,
 use wsnet_session::{
     authok_mac, fresh_epoch, fresh_nonce, fresh_session_id, negotiate_capabilities, session_keys,
     verify_auth, AuthFields, AuthOkFields, HelloFields, HelloOkFields, OpenFields,
-    OpenResultFields, OpenStatus, Session, SessionConfig, SessionState, Side,
+    OpenResultFields, OpenStatus, ResetReason, Session, SessionConfig, SessionError, SessionState,
+    Side,
 };
 use wsnet_site::{FailureStage, Response as SiteResponse, Site, StageResponse};
 use wsnet_transport::Carrier;
 
 use crate::bind::{verify_binding_mac, BindProof, BindProofError, BindProofRegistry, BindTarget};
+use crate::egress::EgressPolicy;
 use crate::error::HubStartError;
 use crate::guard::{DosGuards, GuardError, UnauthenticatedConnection};
 use crate::server;
@@ -88,7 +92,6 @@ const DETAIL_SERVICE_OFFLINE: &str = "the publishing node has no live lease on t
 const DETAIL_SERVICE_PROTO: &str = "the published service protocol differs from the open";
 const DETAIL_SERVICE_STALE: &str = "the pinned service revision is stale";
 const DETAIL_RELAY_UNIMPLEMENTED: &str = "multi-hop relay is not implemented in this build";
-const DETAIL_EXIT_UNIMPLEMENTED: &str = "hub exit dialling is not implemented in this build";
 const DETAIL_SERVICE_UNIMPLEMENTED: &str =
     "forwarding to the publishing node is not implemented in this build";
 const DETAIL_NODE_EXIT_UNIMPLEMENTED: &str =
@@ -379,6 +382,8 @@ pub struct Hub {
     profiles: ProfilePaths,
     acl: AclTable,
     relay: RelayAllow,
+    /// Section 9.3's egress guard, derived from the same ACL rules.
+    egress: EgressPolicy,
     nonces: Mutex<NonceStore>,
     binds: Mutex<BindProofRegistry>,
     registry: Mutex<Registry>,
@@ -429,6 +434,11 @@ impl Hub {
 
         let acl = config.acl_table()?;
         let relay = config.relay_allow();
+        // Section 9.3's egress allowlist is configuration too, so it is read from
+        // the same rules that authorise the access: a rule that writes an address
+        // range down is an explicit allowlist entry, an ordinary "any address"
+        // rule is not.
+        let egress = EgressPolicy::from_rules(&config.acl);
         let nonce_config = NonceStoreConfig {
             window_secs: config.server.auth_window_secs,
             per_node_max: config.server.auth_nonce_max_per_node,
@@ -443,6 +453,7 @@ impl Hub {
             profiles,
             acl,
             relay,
+            egress,
             nonces: Mutex::new(NonceStore::new(nonce_config)?),
             binds: Mutex::new(BindProofRegistry::new()),
             registry: Mutex::new(Registry::new(config.server.hub_id.clone())),
@@ -490,6 +501,11 @@ impl Hub {
             return Carrier::Post;
         }
         self.profiles.carrier_for(path).unwrap_or(Carrier::Post)
+    }
+
+    /// Section 9.3's egress guard, as the data plane uses it.
+    pub(crate) fn egress_policy(&self) -> &EgressPolicy {
+        &self.egress
     }
 
     /// Number of live sessions.
@@ -598,6 +614,9 @@ impl Hub {
         }
         entry.closed.store(true, Ordering::SeqCst);
         entry.handle.set_state(SessionState::Closed);
+        // Section 5.3: the local side reclaims its resources, so every stream
+        // task loses its sink and frees its target socket.
+        entry.close_streams();
         let node_id = entry.node_id.clone();
         match self
             .registry
@@ -787,10 +806,32 @@ impl Hub {
     /// Feeds sealed envelopes into a session and arbitrates whatever they produce.
     pub(crate) fn feed_records(&self, entry: &SharedSession, envelopes: &[Vec<u8>]) {
         for envelope in envelopes {
-            if !entry.handle.feed_lossy(envelope) {
+            match entry.handle.feed(envelope) {
+                Ok(()) => {}
+                // Section 4.2 and section 7.3: a duplicated envelope is normal on
+                // a lossy carrier, so it is dropped rather than treated as an
+                // attack, and the rest of the batch still counts.
+                Err(SessionError::Replay(_)) => tracing::trace!(
+                    session = %hex::encode(entry.session_id),
+                    "dropping a replayed envelope"
+                ),
+                // Section 8: an unknown stream is refused explicitly. The engine
+                // has already declined to create anything for it, so this is an
+                // answer, never a new dial.
+                Err(SessionError::UnknownStream(stream_id)) => {
+                    tracing::debug!(
+                        session = %hex::encode(entry.session_id),
+                        stream_id,
+                        "resetting a record for an unknown stream"
+                    );
+                    let _ = entry.handle.send_reset(stream_id, ResetReason::ProtocolError);
+                }
                 // Section 9.1: a forged or malformed record is counted and
                 // dropped; it never reaches business state.
-                tracing::debug!(session = %hex::encode(entry.session_id), "dropping an unauthenticated envelope");
+                Err(_) => tracing::debug!(
+                    session = %hex::encode(entry.session_id),
+                    "dropping an unauthenticated envelope"
+                ),
             }
         }
         self.pump_session(entry);
@@ -831,13 +872,15 @@ impl Hub {
                 tracing::debug!(session = %hex::encode(entry.session_id), reason = %fields.reason, "peer said Bye");
                 self.close_session(&entry.session_id, &entry.epoch, "bye");
             }
-            Event::Data { stream_id, .. } => {
-                // The egress data plane is not implemented, so a stream that
-                // somehow produced data is reset rather than silently dropped:
-                // section 7.2 requires an explicit failure over a stall.
-                let _ = entry
-                    .handle
-                    .send_reset(stream_id, wsnet_session::ResetReason::Unreachable);
+            Event::Data { .. }
+            | Event::Fin(_)
+            | Event::Reset(_)
+            | Event::Progress(_)
+            | Event::Ready(_) => {
+                // Section 7.1: every leg of a stream keeps its own local mapping,
+                // so a stream event belongs to the task that owns that stream's
+                // socket rather than to the session's business logic.
+                self.on_stream_event(entry, event);
             }
             Event::Datagram { .. } => {
                 // Section 7.4: a datagram with no association is dropped and
@@ -868,6 +911,45 @@ impl Hub {
                 );
             }
         }
+    }
+
+    /// Routes one stream event to its task, or refuses the stream (section 8).
+    ///
+    /// Section 8 keeps an unknown stream from creating anything new: it is
+    /// answered with an authenticated `Reset` while every other stream stays
+    /// usable. A `Reset` for a stream nobody owns is the peer's own teardown
+    /// arriving late, so it is dropped rather than answered with a second one,
+    /// which two implementations of this rule would otherwise ping-pong forever.
+    fn on_stream_event(&self, entry: &SharedSession, event: wsnet_session::SessionEvent) {
+        use wsnet_session::SessionEvent as Event;
+        let stream_id = match &event {
+            Event::Data { stream_id, .. }
+            | Event::Fin(wsnet_session::FinFields { stream_id, .. })
+            | Event::Reset(wsnet_session::ResetFields { stream_id, .. })
+            | Event::Progress(wsnet_session::ProgressFields { stream_id, .. })
+            | Event::Ready(wsnet_session::ReadyFields { stream_id }) => *stream_id,
+            // The caller only routes the variants listed here.
+            _ => return,
+        };
+        let was_reset = matches!(event, Event::Reset(_));
+        if entry.route_stream_event(stream_id, event) {
+            return;
+        }
+        if was_reset {
+            tracing::trace!(
+                session = %hex::encode(entry.session_id),
+                stream_id,
+                "a reset arrived for a stream that is already gone"
+            );
+            return;
+        }
+        tracing::debug!(
+            session = %hex::encode(entry.session_id),
+            stream_id,
+            "resetting an event for an unknown stream"
+        );
+        let _ = entry.handle.send_reset(stream_id, ResetReason::ProtocolError);
+        entry.flush_outbound();
     }
 
     /// Section 5.3: `Hello` registers the node, and only `HelloOk` lifts the
@@ -929,19 +1011,43 @@ impl Hub {
     }
 
     /// Turns an `Open` into an `OpenResult`, authorising before anything else.
+    ///
+    /// An authorised [`ExitPlan::HubExit`] is handed to the egress data plane,
+    /// which dials and answers asynchronously so that a slow target cannot block
+    /// the carrier that delivered the `Open` (section 7.1's ten-second leg
+    /// budget). Every other plan is refused here with a detail that names the
+    /// missing piece rather than pretending the stream exists.
     fn on_open(&self, entry: &SharedSession, fields: OpenFields) {
-        let (status, detail) = match self.authorize_open(&entry.node_id, &fields) {
+        match self.authorize_open(&entry.node_id, &fields) {
+            Ok(ExitPlan::HubExit { host, port }) => {
+                crate::dataplane::spawn_hub_exit(self, entry, &fields, host, port);
+            }
             Ok(plan) => {
                 let detail = match &plan {
                     ExitPlan::Relay { .. } => DETAIL_RELAY_UNIMPLEMENTED,
                     ExitPlan::ServiceExit { .. } => DETAIL_SERVICE_UNIMPLEMENTED,
                     ExitPlan::NodeExit { .. } => DETAIL_NODE_EXIT_UNIMPLEMENTED,
-                    ExitPlan::HubExit { .. } => DETAIL_EXIT_UNIMPLEMENTED,
+                    // A `HubExit` is dialled above, so this cannot be reached;
+                    // naming it keeps the match total without a panic.
+                    ExitPlan::HubExit { .. } => DETAIL_SERVICE_UNIMPLEMENTED,
                 };
-                (OpenStatus::Refused, detail)
+                self.refuse_open(entry, &fields, OpenStatus::Refused, detail);
             }
-            Err(refusal) => (refusal.status, refusal.detail),
-        };
+            Err(refusal) => self.refuse_open(entry, &fields, refusal.status, refusal.detail),
+        }
+    }
+
+    /// Answers an `Open` that will never carry traffic.
+    ///
+    /// A non-`Ok` status makes the engine drop the stream state, so a refused
+    /// `Open` leaves nothing registered for a later event to find.
+    pub(crate) fn refuse_open(
+        &self,
+        entry: &SharedSession,
+        fields: &OpenFields,
+        status: OpenStatus,
+        detail: &str,
+    ) {
         let result = OpenResultFields {
             request_id: fields.request_id,
             stream_id: fields.stream_id,
@@ -949,8 +1055,13 @@ impl Hub {
             detail: detail.to_string(),
         };
         if let Err(error) = entry.handle.send_open_result(&result) {
-            tracing::debug!(node = %entry.node_id, %error, "cannot answer Open");
+            tracing::debug!(
+                session = %hex::encode(entry.session_id),
+                %error,
+                "cannot answer Open"
+            );
         }
+        entry.flush_outbound();
     }
 
     /// Decides whether an `Open` may proceed, and to which exit leg (sections 7.1,

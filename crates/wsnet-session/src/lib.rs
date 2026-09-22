@@ -19,9 +19,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bind;
 pub mod engine;
 pub mod handshake;
 pub mod message;
+
+pub use bind::{
+    binding_fields, binding_mac, body_hash, verify_binding_mac, BindProof, BindProofError,
+    BindProofRegistry, BindTarget, BIND_NONCE_MAX, BIND_PROOF_HEADER, BIND_PROOF_VERSION,
+    MAX_PROOF_LIFETIME_SECS,
+};
 
 pub use engine::{
     Session, SessionConfig, SessionError, SessionEvent, SessionHandle, SessionState, Side,

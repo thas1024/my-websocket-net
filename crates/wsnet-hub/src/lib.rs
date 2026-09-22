@@ -30,14 +30,24 @@
 //!   the single place that turns an `Open` into a decision, and it is default-deny
 //!   in the sense of section 9.3: an empty `[[acl]]` permits nothing.
 //!
-//! # What this build deliberately does not implement
+//! # What this build implements, and what it deliberately does not
 //!
-//! The Hub-side *egress data plane* is not implemented. An `Open` that passes
-//! every authorisation check is answered with a clear `OpenResult` refusal rather
-//! than silently succeeding, and multi-hop `via` chains are validated and then
-//! refused with a distinct detail. See [`Hub::authorize_open`].
+//! The Hub-exit leg of the egress data plane is implemented: an
+//! `Open` that authorises to [`ExitPlan::HubExit`] resolves its destination once,
+//! checks every candidate address against [`EgressPolicy`] (section 9.3), dials
+//! the address that passed, and then carries bytes in both directions under the
+//! peer's credit and half-close rules (sections 7.2, 7.5). Each stream runs in
+//! its own task, so one slow target cannot stall the session or another stream.
+//!
+//! The other three exit plans are still refused with a distinct detail:
+//! `ServiceExit` and `NodeExit` need a cooperating node to terminate the leg and
+//! multi-hop `Relay` needs the star-shaped chain of section 7.1, so an `Open`
+//! that resolves to one of them is answered with a named refusal rather than a
+//! silent success. See [`Hub::authorize_open`].
 
 pub mod bind;
+pub mod egress;
+mod dataplane;
 mod error;
 mod guard;
 mod hub;
@@ -48,5 +58,6 @@ pub use bind::{
     binding_mac, body_hash, BindProof, BindProofError, BindProofRegistry, BindTarget,
     BIND_PROOF_HEADER,
 };
+pub use egress::{classify, AddressClass, EgressPolicy, EgressRefusal};
 pub use error::HubStartError;
 pub use hub::{ExitPlan, Hub, NodeSecrets, OpenRefusal, ProfilePaths, DEFAULT_SESSION_TTL_SECS};

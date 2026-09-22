@@ -25,19 +25,16 @@ use reqwest::Client;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use wsnet_limits::{HANDSHAKE_TIMEOUT_MS, MAX_POST_BATCH_BYTES, MAX_POST_BATCH_RECORDS};
+use wsnet_limits::{
+    BIND_PROOF_TTL_SECS, HANDSHAKE_TIMEOUT_MS, MAX_POST_BATCH_BYTES, MAX_POST_BATCH_RECORDS,
+};
+use wsnet_session::{binding_mac, body_hash, BindProof, BindTarget, BIND_PROOF_HEADER};
 use wsnet_transport::{post, SseDecoder};
 
 use crate::carrier::{CarrierIo, CarrierKind};
 use crate::endpoint::{BoundSession, HubEndpoint, HubTransport, TransportFactory};
 use crate::node::NodeError;
 use crate::BoxFuture;
-
-/// The header a Hub uses to attribute a request to an authenticated session.
-///
-/// DESIGN.md section 4.4 keeps session material in headers or bodies and never in
-/// a URL, so that a front-end log cannot capture it together with the path.
-const SESSION_HEADER: &str = "x-wsnet-session";
 
 /// Builds the HTTP carrier set for every Hub.
 pub struct HttpTransportFactory {
@@ -103,13 +100,64 @@ impl HttpTransport {
         format!("{}/e", self.base)
     }
 
-    fn session_headers(session: &BoundSession) -> HeaderMap {
+    /// Builds the `BindProof` header for one request.
+    ///
+    /// Section 4.4 makes the proof cover the method, the canonical path, the
+    /// session identity, the channel, the *body hash*, and an expiry, and makes
+    /// the nonce single-use. A proof is therefore built once per request rather
+    /// than once per session, which is why this cannot be a cached header map:
+    /// a proof for an empty-body `GET /e` must not be replayable onto a `POST /m`
+    /// carrying a batch.
+    fn bind_headers(session: &BoundSession, method: &str, path: &str, body: &[u8]) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        if let Ok(value) = HeaderValue::from_str(&hex::encode(session.session_id)) {
-            headers.insert(SESSION_HEADER, value);
+        let now = unix_seconds();
+        let proof = BindProof {
+            session_id: session.session_id,
+            channel_id: fresh_channel_id(),
+            bind_nonce: fresh_bind_nonce(),
+            // Section 4.4 caps the lifetime at 30 seconds and at the session
+            // expiry; the session TTL is far longer, so the cap is what binds.
+            expires_at: now + BIND_PROOF_TTL_SECS as i64,
+            mac: [0u8; 32],
+        };
+        let target = BindTarget {
+            method,
+            path,
+            hub_id: &session.hub_id,
+            session_id: session.session_id,
+            session_epoch: session.session_epoch,
+            channel_id: proof.channel_id,
+            bind_nonce: proof.bind_nonce,
+            body_hash: body_hash(body),
+            expires_at: proof.expires_at,
+        };
+        let mac = binding_mac(&session.bind_key, &target);
+        let proof = BindProof { mac, ..proof };
+        if let Ok(value) = HeaderValue::from_str(&proof.encode()) {
+            headers.insert(BIND_PROOF_HEADER, value);
         }
         headers
     }
+}
+
+/// A fresh 16-byte carrier channel id.
+fn fresh_channel_id() -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    bytes
+}
+
+/// A fresh 16-byte single-use binding nonce.
+fn fresh_bind_nonce() -> [u8; 16] {
+    fresh_channel_id()
+}
+
+/// UTC Unix seconds, matching the Hub's window arithmetic.
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl HubTransport for HttpTransport {
@@ -160,7 +208,6 @@ impl HubTransport for HttpTransport {
         let message_url = self.message_url();
         let events_url = self.events_url();
         let timeout = self.request_timeout;
-        let headers = Self::session_headers(&session);
         Box::pin(async move {
             let (uplink_tx, uplink_rx) = mpsc::unbounded_channel();
             // The POST responses and the SSE subscription are reported as
@@ -173,11 +220,11 @@ impl HubTransport for HttpTransport {
                 client.clone(),
                 message_url,
                 timeout,
-                headers.clone(),
+                session.clone(),
                 uplink_rx,
                 post_tx,
             );
-            spawn_sse_carrier(client, events_url, headers, sse_tx);
+            spawn_sse_carrier(client, events_url, session, sse_tx);
 
             Ok(vec![
                 CarrierIo::new(CarrierKind::Post, post_rx, uplink_tx),
@@ -193,7 +240,7 @@ impl HubTransport for HttpTransport {
         let client = self.client.clone();
         let url = self.message_url();
         let timeout = self.request_timeout;
-        let headers = Self::session_headers(&session);
+        let headers = Self::bind_headers(&session, "POST", "/m", &[]);
         Box::pin(async move {
             // Section 5.5 forbids treating a static page as proof of a working
             // proxy, so the check is an authenticated POST into the session
@@ -219,11 +266,15 @@ impl HubTransport for HttpTransport {
 }
 
 /// Batches uplink envelopes into `POST /m`, and feeds the response bodies back.
+///
+/// Each request gets a fresh `BindProof` over the body it actually sends, because
+/// the proof commits to the body hash: a cached header map would be rejected as
+/// soon as the batch changed.
 fn spawn_post_carrier(
     client: Client,
     url: String,
     timeout: Duration,
-    headers: HeaderMap,
+    session: BoundSession,
     mut uplink: mpsc::UnboundedReceiver<Vec<u8>>,
     inbound: mpsc::UnboundedSender<Vec<u8>>,
 ) {
@@ -249,9 +300,10 @@ fn spawn_post_carrier(
                     continue;
                 }
             };
+            let headers = HttpTransport::bind_headers(&session, "POST", "/m", &body);
             let response = client
                 .post(&url)
-                .headers(headers.clone())
+                .headers(headers)
                 .timeout(timeout)
                 .body(body)
                 .send()
@@ -296,10 +348,13 @@ fn spawn_post_carrier(
 fn spawn_sse_carrier(
     client: Client,
     url: String,
-    headers: HeaderMap,
+    session: BoundSession,
     inbound: mpsc::UnboundedSender<Vec<u8>>,
 ) {
     tokio::spawn(async move {
+        // A `GET` carries no body, so the proof commits to the hash of an empty
+        // body and to the `/e` path, which is what stops it being reused on `/m`.
+        let headers = HttpTransport::bind_headers(&session, "GET", "/e", &[]);
         let request = client
             .get(&url)
             .headers(headers)

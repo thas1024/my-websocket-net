@@ -29,7 +29,7 @@ pub struct HubEndpoint {
 /// The session id is a routing label, never a bearer credential (DESIGN.md
 /// section 4.4), which is why it is safe to hand to a transport purely so that
 /// requests land in the right per-session queue.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BoundSession {
     /// Hub the session belongs to.
     pub hub_id: String,
@@ -39,6 +39,25 @@ pub struct BoundSession {
     pub session_id: [u8; 16],
     /// Session key epoch.
     pub session_epoch: [u8; 16],
+    /// The binding key `K_bind` from section 4.2.
+    ///
+    /// Section 4.4 requires every authenticated carrier request to present a
+    /// `BindProof` MACed with this key, and the transport is where that proof is
+    /// built, so the key has to reach it. It never leaves this process, and the
+    /// manual `Debug` below keeps it out of logs.
+    pub bind_key: [u8; 32],
+}
+
+impl core::fmt::Debug for BoundSession {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BoundSession")
+            .field("hub_id", &self.hub_id)
+            .field("node_id", &self.node_id)
+            .field("session_id", &hex::encode(self.session_id))
+            .field("session_epoch", &hex::encode(self.session_epoch))
+            .field("bind_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// One Hub's carrier plumbing.
