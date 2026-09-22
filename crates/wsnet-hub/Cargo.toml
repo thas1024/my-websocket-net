@@ -30,3 +30,9 @@ rand.workspace = true
 serde.workspace = true
 hex.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+# Test binaries install no subscriber, so `tracing::debug!` inside the data plane
+# is invisible when a test hangs. This makes the diagnostics reachable.
+tracing-subscriber.workspace = true
+

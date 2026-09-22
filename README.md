@@ -40,7 +40,12 @@
 
 这一路径调出并修掉了一个真实对接缺陷：节点曾把 `Auth` 作为裸 canonical JSON 发送，而 Hub 按 §4.3 的载体分帧解码为 record，因此一律被站点 404 失败外观拒绝（按 §9.1 该外观不带原因，日志里看不出所以然）。此外节点侧原先完全没有实现 §4.4 的 `BindProof`，`Hello` 永远过不去；现已按共享的签名输入实现。
 
-Hub 出站初版落地后，其自带的 4 个 dataplane 单测**当前是失败的**（等待会话事件超时），而走真实载体的端到端验收是通过的——即被测功能可用，是那 4 个单测的驱动脚手架有问题，仍待修。
+Hub 出站初版落地后，其自带的 4 个 dataplane 单测一度失败。定位结果一半是测试写错、一半是**真实生产缺陷**：
+
+- 测试在目标 socket 没有半关闭的情况下就等待 `Fin`，而 §7.2 的 `Fin` 只在 EOF 时发出——测试自相矛盾；另有一个断言依赖 OS 本地化错误串（中文 Windows 不产生 `"refused"`），这本身就说明不该把系统文案当协议 detail（已改为按 `io::ErrorKind` 映射的稳定英文）。
+- pump 循环里 `if !pending.is_empty() { flush_outbound() }` 的判断写反了方向：`deliver` 成功时会把 `pending` 排空，所以**恰好是刚产生新下行记录的那种情况不 flush**，数据滞留在引擎里，直到对端凑巧发来别的请求才被带走。也就是说下行延迟取决于对端是否碰巧发东西。改为无条件 flush 后修复。
+
+修复后 `cargo test --workspace` 为 **541 passed / 0 failed**，`clippy --workspace --all-targets -D warnings` 干净。
 
 > Windows 提示：配置里的路径若含反斜杠需写成 `C:/...` 或 TOML 字面串 `'C:\...'`，否则会被当作转义序列（`invalid unicode 8-digit hex code`）。
 

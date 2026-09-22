@@ -239,12 +239,25 @@ impl HubExit {
                     return Ok(stream);
                 }
                 Ok(Err(error)) => {
-                    let status = if error.kind() == std::io::ErrorKind::ConnectionRefused {
-                        OpenStatus::Refused
-                    } else {
-                        OpenStatus::Unreachable
+                    // The detail is a protocol field and a log line, so it must
+                    // not be the OS message: that text is localized, varies
+                    // between builds, and would leak host wording. Map the kind
+                    // to a stable name instead.
+                    let (status, detail) = match error.kind() {
+                        std::io::ErrorKind::ConnectionRefused => (
+                            OpenStatus::Refused,
+                            "the target refused the connection".to_string(),
+                        ),
+                        std::io::ErrorKind::TimedOut => (
+                            OpenStatus::Unreachable,
+                            "connecting to the destination timed out".to_string(),
+                        ),
+                        other => (
+                            OpenStatus::Unreachable,
+                            format!("connect failed: {other:?}"),
+                        ),
                     };
-                    last = Some(DialFailure::new(status, format!("connect failed: {error}")));
+                    last = Some(DialFailure::new(status, detail));
                 }
                 Err(_) => {
                     last = Some(DialFailure::new(
@@ -328,9 +341,12 @@ impl HubExit {
                 self.reset_stream(ResetReason::Unreachable);
                 return;
             }
-            if !pending.is_empty() {
-                self.session.flush_outbound();
-            }
+            // Flush unconditionally. `deliver` drains `pending` when it succeeds,
+            // so gating this on `pending` still holding bytes skipped precisely
+            // the case that had just produced new downlink records: the data then
+            // sat in the engine until unrelated traffic happened to flush it,
+            // which made downlink latency depend on the peer sending something.
+            self.session.flush_outbound();
 
             // Section 7.2: the target's end of stream is a half-close.
             if target_eof && pending.is_empty() && !fin_sent {
@@ -484,6 +500,25 @@ mod tests {
     use super::*;
     use crate::hub::NodeSecrets;
 
+    /// Installs a tracing subscriber once per test binary.
+    ///
+    /// A test binary has no subscriber by default, so every `tracing::debug!` in
+    /// the data plane is silently discarded — which makes a hanging test
+    /// undiagnosable. `RUST_LOG=wsnet_hub=debug` now actually produces output.
+    fn init_tracing() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
+                )
+                .with_test_writer()
+                .try_init();
+        });
+    }
+
     const HUB_ID: &str = "hub-a";
     const NODE_ID: &str = "client-a";
     const KEY_ID: &str = "a-1";
@@ -555,6 +590,7 @@ mod tests {
     }
 
     async fn pair(acl: Vec<AclRule>) -> Paired {
+        init_tracing();
         let config = ServerConfig {
             server: ServerSection {
                 hub_id: HUB_ID.to_string(),
@@ -615,9 +651,15 @@ mod tests {
                         feeding_hub.feed_records(&feeding_entry, &[envelope]);
                     }
                     Ok(envelope) = downlink.recv() => {
-                        let _ = feeding_handle.feed_lossy(&envelope);
+                        let accepted = feeding_handle.feed_lossy(&envelope);
+                        tracing::debug!(
+                            accepted,
+                            len = envelope.len(),
+                            "harness pump: hub -> node"
+                        );
                     }
                     Some(event) = node_events.recv() => {
+                        tracing::debug!(?event, "harness pump: node event");
                         if event_tx.send(event).is_err() {
                             break;
                         }
@@ -772,6 +814,11 @@ mod tests {
                 .write_all(b"hello from the target")
                 .await
                 .expect("the target must be able to write");
+            // Section 7.2 sends `Fin` on EOF, so the test has to actually close
+            // the target's write half; without this the Hub can never observe an
+            // end of stream and the wait below is for something that cannot
+            // happen.
+            let _ = target.shutdown().await;
             let (bytes, fin) = pair.read_until_fin(stream_id).await;
             assert_eq!(bytes, b"hello from the target");
             // The target half-closed, so the peer sees the same stream end.
@@ -964,6 +1011,9 @@ mod tests {
                 .write_all(b"local service")
                 .await
                 .expect("the target writes");
+            // `Fin` follows EOF (section 7.2), so the target's write half must be
+            // closed before an end of stream can be observed.
+            let _ = target.shutdown().await;
             let (bytes, _) = allowed.read_until_fin(stream_id).await;
             assert_eq!(bytes, b"local service");
         })
@@ -1000,6 +1050,8 @@ mod tests {
                 .write_all(b"still alive")
                 .await
                 .expect("the target writes");
+            // Same reason as above: `Fin` needs a real end of stream.
+            let _ = target.shutdown().await;
             let (bytes, _) = pair.read_until_fin(stream_id).await;
             assert_eq!(bytes, b"still alive");
         })
