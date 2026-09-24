@@ -30,14 +30,15 @@ use wsnet_protocol::{Canonical, PROTOCOL_VERSION};
 use wsnet_routing::{Destination, Proto};
 use wsnet_session::{
     auth_mac, fresh_attempt_id, fresh_nonce, fresh_session_id, session_keys, verify_authok,
-    AuthFields, HelloFields, OpenStatus, ServiceRegistration, Session, SessionConfig, SessionEvent,
-    SessionHandle, SessionState, Side,
+    AuthFields, HelloFields, OpenFields, OpenResultFields, OpenStatus, ResetReason,
+    ServiceRegistration, Session, SessionConfig, SessionEvent, SessionHandle, SessionState, Side,
 };
 use wsnet_protocol::{MessageKind, Record};
 
 use crate::carrier::CarrierIo;
 use crate::endpoint::{BoundSession, HubEndpoint, HubTransport};
 use crate::health::HealthTracker;
+use crate::inbound::{self, InboundPolicy};
 use crate::node::NodeError;
 use crate::select::ServiceDirectory;
 use crate::stream::{SessionStream, StreamMsg};
@@ -204,6 +205,11 @@ impl HubSession {
             commands: command_rx,
             uplink,
             streams: HashMap::new(),
+            services: services.clone(),
+            // Section 9.3 makes raw node-address access default deny, and wiring
+            // an operator-facing allowlist is still outstanding, so this build
+            // permits published services only.
+            policy: InboundPolicy::deny_all(),
             directory: Arc::clone(&directory),
             operations: Arc::clone(&operations),
             gone: Arc::clone(&gone),
@@ -385,6 +391,13 @@ struct Driver {
     commands: mpsc::UnboundedReceiver<Command>,
     uplink: Option<mpsc::UnboundedSender<Vec<u8>>>,
     streams: HashMap<u64, StreamSlot>,
+    /// Services this node publishes, as registered in its `Hello`.
+    ///
+    /// The same list is what an inbound `ServiceTarget` resolves against, so what
+    /// a caller can reach and what this node will dial cannot drift apart.
+    services: Vec<ServiceRegistration>,
+    /// What an inbound `Open` may reach beyond those services.
+    policy: InboundPolicy,
     directory: Arc<Mutex<ServiceDirectory>>,
     operations: Arc<Mutex<OperationTable>>,
     gone: Arc<Notify>,
@@ -551,8 +564,65 @@ impl Driver {
         let _ = lock(&self.operations).settle(request_id, outcome, now_ms());
     }
 
+    /// Handles an inbound `Open` relayed by the Hub (DESIGN.md section 7.6).
+    ///
+    /// The stream is registered before the task starts, so a `Data` record can
+    /// never arrive for a stream whose socket is not yet being pumped.
+    fn on_inbound_open(&mut self, fields: OpenFields) {
+        if self.streams.contains_key(&fields.stream_id) {
+            // Section 4.2 forbids reusing a stream id, so a second `Open` for a
+            // live stream is a protocol error rather than a second dial.
+            let _ = self
+                .handle
+                .send_reset(fields.stream_id, ResetReason::ProtocolError);
+            return;
+        }
+
+        let node_id = self.handle.config().node_id.clone();
+        let resolved = match inbound::resolve_inbound(&node_id, &self.services, &self.policy, &fields)
+        {
+            Ok(target) => target,
+            Err(refusal) => {
+                debug!(
+                    stream = fields.stream_id,
+                    status = ?refusal.status,
+                    reason = %refusal.detail,
+                    "refusing an inbound open"
+                );
+                let result = OpenResultFields {
+                    request_id: fields.request_id,
+                    stream_id: fields.stream_id,
+                    status: refusal.status,
+                    detail: refusal.detail,
+                };
+                let _ = self.handle.send_open_result(&result);
+                return;
+            }
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.streams.insert(
+            fields.stream_id,
+            StreamSlot {
+                tx,
+                stream: None,
+                reply: None,
+                request_id: fields.request_id,
+            },
+        );
+        let handle = self.handle.clone();
+        tokio::spawn(inbound::serve_inbound(
+            handle,
+            fields.request_id,
+            fields.stream_id,
+            resolved,
+            rx,
+        ));
+    }
+
     fn on_event(&mut self, event: SessionEvent) {
         match event {
+            SessionEvent::Open(fields) => self.on_inbound_open(fields),
             SessionEvent::OpenResult(fields) => self.on_open_result(fields),
             SessionEvent::Ready(fields) => {
                 debug!(stream = fields.stream_id, "stream is ready");

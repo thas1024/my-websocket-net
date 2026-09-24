@@ -92,10 +92,6 @@ const DETAIL_SERVICE_OFFLINE: &str = "the publishing node has no live lease on t
 const DETAIL_SERVICE_PROTO: &str = "the published service protocol differs from the open";
 const DETAIL_SERVICE_STALE: &str = "the pinned service revision is stale";
 const DETAIL_RELAY_UNIMPLEMENTED: &str = "multi-hop relay is not implemented in this build";
-const DETAIL_SERVICE_UNIMPLEMENTED: &str =
-    "forwarding to the publishing node is not implemented in this build";
-const DETAIL_NODE_EXIT_UNIMPLEMENTED: &str =
-    "dialling from the named node is not implemented in this build";
 
 /// The exit leg an `Open` resolved to.
 ///
@@ -536,6 +532,25 @@ impl Hub {
             .unwrap_or_default()
     }
 
+    /// The session that owns a node's live lease, if this Hub has one.
+    ///
+    /// The relay bridge needs the session rather than the lease: section 7.6
+    /// makes the publishing node the final leg, and only a session can carry the
+    /// records of a Hub-initiated stream. The lease names the session, and the
+    /// session table is the second half of the lookup, so a lease whose session
+    /// is gone (or was replaced) resolves to nothing instead of to a stale entry.
+    pub(crate) fn session_for_node(&self, node_id: &str) -> Option<SharedSession> {
+        let session_id = {
+            let registry = self.registry.lock().expect("registry mutex");
+            registry.node(node_id)?.session_id
+        };
+        let entry = self.sessions.get(&session_id)?;
+        if entry.is_closed() || entry.node_id != node_id {
+            return None;
+        }
+        Some(entry)
+    }
+
     /// The stage-appropriate failure response for a request that was never
     /// upgraded and never started SSE (section 9.1).
     pub fn http_failure_response(&self) -> SiteResponse {
@@ -824,7 +839,9 @@ impl Hub {
                         stream_id,
                         "resetting a record for an unknown stream"
                     );
-                    let _ = entry.handle.send_reset(stream_id, ResetReason::ProtocolError);
+                    let _ = entry
+                        .handle
+                        .send_reset(stream_id, ResetReason::ProtocolError);
                 }
                 // Section 9.1: a forged or malformed record is counted and
                 // dropped; it never reaches business state.
@@ -876,7 +893,11 @@ impl Hub {
             | Event::Fin(_)
             | Event::Reset(_)
             | Event::Progress(_)
-            | Event::Ready(_) => {
+            | Event::Ready(_)
+            // A Hub-initiated stream (the relay bridge) is answered by the peer
+            // with an `OpenResult` that only the task serving that stream can
+            // act on, so it is routed like the stream's other events.
+            | Event::OpenResult(_) => {
                 // Section 7.1: every leg of a stream keeps its own local mapping,
                 // so a stream event belongs to the task that owns that stream's
                 // socket rather than to the session's business logic.
@@ -927,7 +948,8 @@ impl Hub {
             | Event::Fin(wsnet_session::FinFields { stream_id, .. })
             | Event::Reset(wsnet_session::ResetFields { stream_id, .. })
             | Event::Progress(wsnet_session::ProgressFields { stream_id, .. })
-            | Event::Ready(wsnet_session::ReadyFields { stream_id }) => *stream_id,
+            | Event::Ready(wsnet_session::ReadyFields { stream_id })
+            | Event::OpenResult(wsnet_session::OpenResultFields { stream_id, .. }) => *stream_id,
             // The caller only routes the variants listed here.
             _ => return,
         };
@@ -948,7 +970,9 @@ impl Hub {
             stream_id,
             "resetting an event for an unknown stream"
         );
-        let _ = entry.handle.send_reset(stream_id, ResetReason::ProtocolError);
+        let _ = entry
+            .handle
+            .send_reset(stream_id, ResetReason::ProtocolError);
         entry.flush_outbound();
     }
 
@@ -1015,23 +1039,29 @@ impl Hub {
     /// An authorised [`ExitPlan::HubExit`] is handed to the egress data plane,
     /// which dials and answers asynchronously so that a slow target cannot block
     /// the carrier that delivered the `Open` (section 7.1's ten-second leg
-    /// budget). Every other plan is refused here with a detail that names the
-    /// missing piece rather than pretending the stream exists.
+    /// budget). An authorised [`ExitPlan::ServiceExit`] or
+    /// [`ExitPlan::NodeExit`] is handed to the relay bridge, which terminates the
+    /// leg on the publishing node's own session for the same reason. Multi-hop
+    /// [`ExitPlan::Relay`] is refused here with a detail that names the missing
+    /// piece rather than pretending the stream exists.
     fn on_open(&self, entry: &SharedSession, fields: OpenFields) {
         match self.authorize_open(&entry.node_id, &fields) {
             Ok(ExitPlan::HubExit { host, port }) => {
                 crate::dataplane::spawn_hub_exit(self, entry, &fields, host, port);
             }
-            Ok(plan) => {
-                let detail = match &plan {
-                    ExitPlan::Relay { .. } => DETAIL_RELAY_UNIMPLEMENTED,
-                    ExitPlan::ServiceExit { .. } => DETAIL_SERVICE_UNIMPLEMENTED,
-                    ExitPlan::NodeExit { .. } => DETAIL_NODE_EXIT_UNIMPLEMENTED,
-                    // A `HubExit` is dialled above, so this cannot be reached;
-                    // naming it keeps the match total without a panic.
-                    ExitPlan::HubExit { .. } => DETAIL_SERVICE_UNIMPLEMENTED,
-                };
-                self.refuse_open(entry, &fields, OpenStatus::Refused, detail);
+            // Section 7.6: the node named by the destination is the final leg, so
+            // the stream is bridged to that node's session rather than dialled
+            // from here.
+            Ok(ExitPlan::ServiceExit { node_id, .. }) | Ok(ExitPlan::NodeExit { node_id, .. }) => {
+                crate::relay::spawn_relay(self, entry, &fields, &node_id);
+            }
+            Ok(ExitPlan::Relay { .. }) => {
+                self.refuse_open(
+                    entry,
+                    &fields,
+                    OpenStatus::Refused,
+                    DETAIL_RELAY_UNIMPLEMENTED,
+                );
             }
             Err(refusal) => self.refuse_open(entry, &fields, refusal.status, refusal.detail),
         }

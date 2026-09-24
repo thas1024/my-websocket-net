@@ -442,7 +442,10 @@ mod tests {
         );
 
         let metadata = EgressPolicy::from_rules(&[rule(true, Some("169.254.169.254/32"))]);
-        assert_eq!(metadata.check(&query("client-a"), ip("169.254.169.254")), Ok(()));
+        assert_eq!(
+            metadata.check(&query("client-a"), ip("169.254.169.254")),
+            Ok(())
+        );
     }
 
     #[test]
@@ -450,8 +453,7 @@ mod tests {
         // The first matching rule wins, exactly as in the ACL itself: a name
         // that resolves into the denied range is refused even though the broad
         // allow rule is what authorised the name.
-        let policy =
-            EgressPolicy::from_rules(&[rule(false, Some("1.2.3.0/24")), rule(true, None)]);
+        let policy = EgressPolicy::from_rules(&[rule(false, Some("1.2.3.0/24")), rule(true, None)]);
         assert_eq!(
             policy.check(&query("client-a"), ip("1.2.3.7")),
             Err(EgressRefusal::NotPermitted)

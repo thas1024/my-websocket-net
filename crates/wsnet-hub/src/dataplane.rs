@@ -220,7 +220,10 @@ impl HubExit {
 
         let mut last: Option<DialFailure> = None;
         for candidate in candidates {
-            if let Err(refusal) = self.policy.check(&self.query(candidate.ip()), candidate.ip()) {
+            if let Err(refusal) = self
+                .policy
+                .check(&self.query(candidate.ip()), candidate.ip())
+            {
                 tracing::debug!(
                     session = %hex::encode(self.session.session_id),
                     stream_id = self.stream_id,
@@ -323,7 +326,11 @@ impl HubExit {
     /// The loop is deliberately single-threaded: one task owns the socket, so
     /// there is no shared buffer to guard, and the session's own event loop is
     /// never involved (section 7.5).
-    async fn pump(&self, socket: &mut TcpStream, events: &mut mpsc::UnboundedReceiver<SessionEvent>) {
+    async fn pump(
+        &self,
+        socket: &mut TcpStream,
+        events: &mut mpsc::UnboundedReceiver<SessionEvent>,
+    ) {
         let mut buffer = vec![0u8; READ_CHUNK];
         // Bytes read from the target that the peer's credit has not yet accepted.
         let mut pending: Vec<u8> = Vec::new();
@@ -451,7 +458,11 @@ impl HubExit {
                         return true;
                     }
                     let take = room.min(pending.len());
-                    if self.handle.send_data(self.stream_id, &pending[..take]).is_err() {
+                    if self
+                        .handle
+                        .send_data(self.stream_id, &pending[..take])
+                        .is_err()
+                    {
                         return false;
                     }
                     pending.drain(..take);
@@ -478,7 +489,7 @@ impl HubExit {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::future::Future;
     use std::net::IpAddr;
     use std::time::Duration;
@@ -494,7 +505,8 @@ mod tests {
     use wsnet_routing::{AclRule, Destination};
     use wsnet_session::{
         auth_mac, session_keys, AuthFields, AuthOkFields, FinFields, HelloFields, OpenStatus,
-        Session, SessionConfig, SessionEvent, SessionHandle, SessionState, Side,
+        ServiceRegistration, Session, SessionConfig, SessionEvent, SessionHandle, SessionState,
+        Side,
     };
 
     use super::*;
@@ -537,14 +549,17 @@ mod tests {
     }
 
     /// Runs one test body under a hard deadline, so a bug cannot hang the suite.
-    async fn within<F: Future>(future: F) -> F::Output {
+    pub(crate) async fn within<F: Future>(future: F) -> F::Output {
         tokio::time::timeout(Duration::from_secs(30), future)
             .await
             .expect("the test did not finish inside its deadline")
     }
 
     /// One bounded wait, so no test blocks on a condition that never comes.
-    async fn soon<F: Future>(what: &str, future: F) -> F::Output {
+    ///
+    /// Visible to the crate's other test modules (the relay bridge reuses this
+    /// harness), which is why it is not private to this module.
+    pub(crate) async fn soon<F: Future>(what: &str, future: F) -> F::Output {
         tokio::time::timeout(Duration::from_secs(10), future)
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
@@ -589,8 +604,16 @@ mod tests {
         rule(AclAction::ConnectAddress, Some("127.0.0.1/32"))
     }
 
-    async fn pair(acl: Vec<AclRule>) -> Paired {
+    /// A Hub that accepts one credential per `(node_id, key_id)` pair.
+    ///
+    /// The relay bridge needs more than one node on the same Hub, so the
+    /// credential set is a parameter rather than `pair`'s single node.
+    pub(crate) fn hub_for_nodes(acl: Vec<AclRule>, nodes: &[(&str, &str)]) -> Arc<Hub> {
         init_tracing();
+        let mut secrets = NodeSecrets::new();
+        for (node_id, key_id) in nodes {
+            secrets.insert(*node_id, *key_id, psk());
+        }
         let config = ServerConfig {
             server: ServerSection {
                 hub_id: HUB_ID.to_string(),
@@ -600,18 +623,68 @@ mod tests {
             nodes: Vec::new(),
             acl,
         };
-        let hub = Arc::new(
-            Hub::new(config, NodeSecrets::new().with(NODE_ID, KEY_ID, psk())).expect("a hub"),
-        );
+        Arc::new(Hub::new(config, secrets).expect("a hub"))
+    }
 
+    /// One node's side of a Hub session, wired to the Hub in-process.
+    pub(crate) struct NodeLink {
+        /// The Hub's session entry for this node.
+        pub(crate) entry: SharedSession,
+        /// The node-side engine handle.
+        pub(crate) node: SessionHandle,
+        /// The node's own events, for the test to arbitrate.
+        pub(crate) events: mpsc::UnboundedReceiver<SessionEvent>,
+        /// The task moving sealed envelopes both ways; it ends with the runtime.
+        pub(crate) pump: JoinHandle<()>,
+    }
+
+    impl NodeLink {
+        /// Sends `Hello` and waits for the session to become ready (section 5.3).
+        ///
+        /// `services` is what the Hub's registry then publishes for this node, and
+        /// `seed` keeps each node's Hello request id distinct.
+        pub(crate) async fn hello(&self, services: Vec<ServiceRegistration>, seed: u8) {
+            self.node
+                .send_control(
+                    MessageKind::Hello,
+                    HelloFields {
+                        request_id: [seed; 16],
+                        services,
+                        capabilities: vec!["flow.credit".to_string()],
+                    }
+                    .to_canonical(),
+                )
+                .expect("the Hello must queue");
+            let ready = self.node.clone();
+            soon("the session to become ready", async move {
+                while ready.state() != SessionState::Ready {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+        }
+    }
+
+    /// Authenticates one node and moves sealed envelopes between the two engines.
+    ///
+    /// The carriers of section 4.3 are not needed to test the data plane: the
+    /// Hub's own `SessionHandle` is driven directly, which is less code and moves
+    /// exactly the same sealed records. `seed` keeps each node's `Auth` distinct,
+    /// which section 5.1's replay window is per credential about.
+    pub(crate) async fn connect_node(
+        hub: &Arc<Hub>,
+        node_id: &str,
+        key_id: &str,
+        seed: u8,
+    ) -> NodeLink {
         let fields = AuthFields {
             version: 1,
             hub_id: HUB_ID.to_string(),
-            key_id: KEY_ID.to_string(),
-            node_id: NODE_ID.to_string(),
-            attempt_id: [0x11; 16],
+            key_id: key_id.to_string(),
+            node_id: node_id.to_string(),
+            attempt_id: [seed; 16],
             ts: now_secs(),
-            nonce: [0x22; 32],
+            nonce: [seed; 32],
             capabilities: vec!["flow.credit".to_string()],
         };
         let mac = auth_mac(&psk(), &fields);
@@ -619,13 +692,13 @@ mod tests {
         let success = hub
             .authenticate(&auth, IpAddr::from([127, 0, 0, 1]))
             .expect("the credentials must authenticate");
-        let (authok, _) = AuthOkFields::from_canonical(&success.authok.metadata)
-            .expect("AuthOk metadata");
+        let (authok, _) =
+            AuthOkFields::from_canonical(&success.authok.metadata).expect("AuthOk metadata");
         let keys = session_keys(&psk(), &fields, &authok);
         let node = Session::new(
             SessionConfig::new(
                 HUB_ID,
-                NODE_ID,
+                node_id,
                 authok.session_id,
                 authok.session_epoch,
                 Side::Node,
@@ -638,7 +711,7 @@ mod tests {
         let (event_tx, events) = mpsc::unbounded_channel();
         let mut outbound = node.outbound;
         let mut node_events = node.events;
-        let feeding_hub = Arc::clone(&hub);
+        let feeding_hub = Arc::clone(hub);
         let feeding_entry = Arc::clone(&entry);
         let feeding_handle = node_handle.clone();
 
@@ -669,32 +742,26 @@ mod tests {
             }
         });
 
-        // `Hello`/`HelloOk` is section 5.3's business barrier.
-        node_handle
-            .send_control(
-                MessageKind::Hello,
-                HelloFields {
-                    request_id: [0x31; 16],
-                    services: Vec::new(),
-                    capabilities: vec!["flow.credit".to_string()],
-                }
-                .to_canonical(),
-            )
-            .expect("the Hello must queue");
-        let ready = node_handle.clone();
-        soon("the session to become ready", async move {
-            while ready.state() != SessionState::Ready {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-
-        Paired {
-            hub,
+        NodeLink {
             entry,
             node: node_handle,
             events,
             pump,
+        }
+    }
+
+    async fn pair(acl: Vec<AclRule>) -> Paired {
+        let hub = hub_for_nodes(acl, &[(NODE_ID, KEY_ID)]);
+        let link = connect_node(&hub, NODE_ID, KEY_ID, 0x11).await;
+        // `Hello`/`HelloOk` is section 5.3's business barrier.
+        link.hello(Vec::new(), 0x31).await;
+
+        Paired {
+            hub,
+            entry: link.entry,
+            node: link.node,
+            events: link.events,
+            pump: link.pump,
         }
     }
 
@@ -833,9 +900,12 @@ mod tests {
                 reply.len()
             );
             let mut echoed = vec![0u8; reply.len()];
-            soon("the target to read the reply", target.read_exact(&mut echoed))
-                .await
-                .expect("the target must read the reply");
+            soon(
+                "the target to read the reply",
+                target.read_exact(&mut echoed),
+            )
+            .await
+            .expect("the target must read the reply");
             assert_eq!(echoed, reply);
             assert_eq!(pair.entry.handle.stream_count(), 1);
         })
@@ -870,7 +940,9 @@ mod tests {
 
             let (first, second) = payload.split_at(11);
             assert_eq!(
-                pair.node.send_data(stream_id, first).expect("the first half"),
+                pair.node
+                    .send_data(stream_id, first)
+                    .expect("the first half"),
                 first.len()
             );
             soon(
@@ -882,14 +954,17 @@ mod tests {
             let mut seen = first.to_vec();
             // The write half must still be open: a shutdown here would truncate.
             let mut extra = [0u8; 1];
-            let early = tokio::time::timeout(Duration::from_millis(200), target.read(&mut extra)).await;
+            let early =
+                tokio::time::timeout(Duration::from_millis(200), target.read(&mut extra)).await;
             assert!(
                 early.is_err(),
                 "the target saw the write half close before the payload arrived: {early:?}"
             );
 
             assert_eq!(
-                pair.node.send_data(stream_id, second).expect("the second half"),
+                pair.node
+                    .send_data(stream_id, second)
+                    .expect("the second half"),
                 second.len()
             );
             soon(
@@ -974,10 +1049,16 @@ mod tests {
                 }
             }
             assert!(consumed, "the peer must have driven the credit forward");
-            assert_eq!(fin, Some(total as u64), "the Fin must close the whole stream");
+            assert_eq!(
+                fin,
+                Some(total as u64),
+                "the Fin must close the whole stream"
+            );
             assert_eq!(received.len(), total, "no byte may be dropped");
             assert_eq!(received, payload, "no byte may be duplicated or reordered");
-            let _target = soon("the writer to finish", writer).await.expect("the writer");
+            let _target = soon("the writer to finish", writer)
+                .await
+                .expect("the writer");
             pair.wait_for_offset(stream_id, total as u64).await;
         })
         .await;
@@ -999,7 +1080,10 @@ mod tests {
             assert_eq!(denied.entry.live_streams(), 0);
             // Nothing was dialled: the listener has no connection to hand out.
             let idle = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
-            assert!(idle.is_err(), "the guard must not dial the target: {idle:?}");
+            assert!(
+                idle.is_err(),
+                "the guard must not dial the target: {idle:?}"
+            );
 
             // Naming the range is the explicit allowlist entry of section 9.3.
             let (allowed_listener, allowed_port) = bind_listener().await;
@@ -1106,9 +1190,12 @@ mod tests {
             pair.node
                 .send_reset(first, ResetReason::Canceled)
                 .expect("the reset must queue");
-            let closed = soon("the first target to see the close", first_target.read(&mut [0u8; 8]))
-                .await
-                .expect("the read must not fail");
+            let closed = soon(
+                "the first target to see the close",
+                first_target.read(&mut [0u8; 8]),
+            )
+            .await
+            .expect("the read must not fail");
             assert_eq!(closed, 0, "the reset stream's socket must be closed");
 
             assert_eq!(

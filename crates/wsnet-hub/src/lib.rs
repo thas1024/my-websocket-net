@@ -39,18 +39,21 @@
 //! peer's credit and half-close rules (sections 7.2, 7.5). Each stream runs in
 //! its own task, so one slow target cannot stall the session or another stream.
 //!
-//! The other three exit plans are still refused with a distinct detail:
-//! `ServiceExit` and `NodeExit` need a cooperating node to terminate the leg and
-//! multi-hop `Relay` needs the star-shaped chain of section 7.1, so an `Open`
-//! that resolves to one of them is answered with a named refusal rather than a
-//! silent success. See [`Hub::authorize_open`].
+//! The node-terminated legs are implemented too: an `Open` that authorises to
+//! [`ExitPlan::ServiceExit`] or [`ExitPlan::NodeExit`] is bridged, in a task of
+//! its own, onto a Hub-initiated stream of the publishing node's session, with
+//! the caller's own destination passed through unchanged so that the publisher
+//! re-resolves it (sections 7.1, 7.6; [`relay`]). Multi-hop `Relay` is still
+//! refused with a distinct detail, because it needs the star-shaped chain of
+//! section 7.1 rather than one cooperating node. See [`Hub::authorize_open`].
 
 pub mod bind;
-pub mod egress;
 mod dataplane;
+pub mod egress;
 mod error;
 mod guard;
 mod hub;
+mod relay;
 mod server;
 mod session;
 

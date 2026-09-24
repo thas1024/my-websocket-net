@@ -30,9 +30,13 @@ thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 hex.workspace = true
+ipnet.workspace = true
 
 [dev-dependencies]
 # The end-to-end acceptance test runs a real Hub in-process against a real node,
 # so the two halves are exercised over actual HTTP/SSE rather than a stub.
 wsnet-hub.workspace = true
+# Test binaries install no subscriber by default, which makes a hung acceptance
+# test produce no output at all; this is what makes `RUST_LOG` work here.
+tracing-subscriber.workspace = true
 

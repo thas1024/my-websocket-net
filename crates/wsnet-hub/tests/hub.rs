@@ -546,6 +546,27 @@ impl NodeSession {
         via: Vec<&str>,
         tag: u8,
     ) -> OpenResultFields {
+        let records = self.open_reply(server, destination, via, tag).await;
+        let result = records
+            .iter()
+            .find(|record| record.kind == MessageKind::OpenResult)
+            .expect("Open must be answered with OpenResult");
+        OpenResultFields::from_canonical(&result.metadata).unwrap()
+    }
+
+    /// Every record one bound `Open` produced, whatever they are.
+    ///
+    /// An `Open` that resolves to a node-terminated leg (section 7.6) is not
+    /// answered in this reply: the Hub first opens a stream on the publishing
+    /// node's session and answers only once that node reports both halves, so a
+    /// bridged `Open` has no `OpenResult` here while every refusal has one.
+    async fn open_reply(
+        &self,
+        server: &TestServer,
+        destination: Destination,
+        via: Vec<&str>,
+        tag: u8,
+    ) -> Vec<Record> {
         let open = OpenFields {
             request_id: [0x41; 16],
             stream_id: 1,
@@ -556,12 +577,7 @@ impl NodeSession {
         let envelope = self.seal(MessageKind::Open, open.to_canonical(), Vec::new());
         let response = self.post_sealed(server, "/m", vec![envelope], tag).await;
         assert_eq!(response.status, 200, "a bound Open must be accepted");
-        let records = self.reply_records(&response);
-        let result = records
-            .iter()
-            .find(|record| record.kind == MessageKind::OpenResult)
-            .expect("Open must be answered with OpenResult");
-        OpenResultFields::from_canonical(&result.metadata).unwrap()
+        self.reply_records(&response)
     }
 }
 
@@ -842,8 +858,8 @@ async fn a_service_without_an_acl_rule_is_denied_and_nothing_is_dialled() {
     .await;
 }
 
-/// Section 7.6: with its own rule a published service resolves, and the Hub
-/// refuses the unimplemented exit leg instead of pretending it succeeded.
+/// Section 7.6: with its own rule a published service resolves to the publishing
+/// node's leg, and a service rule still grants no raw address access.
 #[tokio::test]
 async fn a_service_with_a_rule_resolves_and_a_service_rule_grants_no_raw_access() {
     within(async {
@@ -869,14 +885,18 @@ async fn a_service_with_a_rule_resolves_and_a_service_rule_grants_no_raw_access(
         )
         .await;
 
-        let result = node
-            .open(&server, Destination::service(NODE_ID, "web"), Vec::new(), 2)
+        // The rule resolves the service, so the Hub bridges the leg to the
+        // publishing node instead of refusing it: the answer comes only once
+        // that node reports both halves, so this reply carries no
+        // `OpenResult`. A refusal would have answered here.
+        let records = node
+            .open_reply(&server, Destination::service(NODE_ID, "web"), Vec::new(), 2)
             .await;
-        assert_eq!(result.status, OpenStatus::Refused);
         assert!(
-            result.detail.contains("not implemented"),
-            "the refusal must name the missing piece: {}",
-            result.detail
+            !records
+                .iter()
+                .any(|record| record.kind == MessageKind::OpenResult),
+            "a bridged Open must not be answered before the publishing node answers"
         );
 
         // The same rule must not admit a raw address in that node's view.
@@ -924,20 +944,22 @@ async fn a_node_address_target_needs_its_own_rule() {
         .await;
         let node = authenticate(&server).await;
         node.register(&server, Vec::new(), 1).await;
+        // Its own rule admits the address, so the leg is bridged to the named
+        // node and the answer waits for that node (section 7.6).
         let allowed = node
-            .open(
+            .open_reply(
                 &server,
                 Destination::node_address(NODE_ID, "127.0.0.1", 22),
                 Vec::new(),
                 2,
             )
             .await;
-        assert_ne!(
-            allowed.status,
-            OpenStatus::Denied,
-            "its own rule must admit the address"
+        assert!(
+            !allowed
+                .iter()
+                .any(|record| record.kind == MessageKind::OpenResult),
+            "its own rule must admit the address into a bridge"
         );
-        assert_eq!(allowed.status, OpenStatus::Refused);
     })
     .await;
 }

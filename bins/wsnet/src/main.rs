@@ -56,6 +56,12 @@ enum Command {
         /// Path to `client.toml`.
         #[arg(long, value_name = "FILE")]
         config: PathBuf,
+        /// Override the local control endpoint.
+        ///
+        /// The default is per-user, so a second daemon for the same user needs
+        /// its own name; this is what makes two identities on one host possible.
+        #[arg(long, value_name = "ENDPOINT")]
+        endpoint: Option<String>,
     },
     /// Ask the running node for its status.
     Status {
@@ -125,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
 
     match Cli::parse().command {
         Command::Check { config } => check(&config),
-        Command::Run { config } => run(&config).await,
+        Command::Run { config, endpoint } => run(&config, endpoint.as_deref()).await,
         Command::Status { endpoint } => status(endpoint.as_deref()).await,
         Command::Services {
             command: ServicesCommand::List {
@@ -156,7 +162,7 @@ fn check(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run(path: &Path) -> anyhow::Result<()> {
+async fn run(path: &Path, endpoint_override: Option<&str>) -> anyhow::Result<()> {
     let config =
         ClientConfig::load_from_path(path).with_context(|| format!("loading {}", path.display()))?;
 
@@ -169,7 +175,10 @@ async fn run(path: &Path) -> anyhow::Result<()> {
     let options = NodeOptions::default();
     let node = Node::build(config, options).context("building the node")?;
 
-    let endpoint = default_endpoint().context("resolving the control endpoint")?;
+    let endpoint = match endpoint_override {
+        Some(value) => Endpoint::new(value)?,
+        None => default_endpoint().context("resolving the control endpoint")?,
+    };
     let server = ControlServer::bind(&endpoint)
         .await
         .with_context(|| format!("binding the control endpoint {}", endpoint.as_str()))?;

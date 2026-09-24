@@ -133,7 +133,11 @@ impl SessionEntry {
     ///
     /// Section 4.2 forbids reusing a stream id, so a second task for the same id
     /// would be a second dial for one stream; the caller must refuse instead.
-    pub(crate) fn claim_stream(&self, stream_id: u64, sink: mpsc::UnboundedSender<SessionEvent>) -> bool {
+    pub(crate) fn claim_stream(
+        &self,
+        stream_id: u64,
+        sink: mpsc::UnboundedSender<SessionEvent>,
+    ) -> bool {
         let mut pump = self.pump.lock().expect("pump mutex");
         if pump.streams.contains_key(&stream_id) {
             return false;

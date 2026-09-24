@@ -27,8 +27,9 @@
 
 ### 已知缺口（明确列出，避免把设计当成已实现）
 
-- **Hub 出站只实现了 `HubExit`**：地址型目标会真正解析、按 §9.3 校验每个候选 IP、拨号并双向搬运字节。`ServiceExit`、`NodeExit` 与多跳 `Relay` 仍以带明确原因的 `OpenResult` 拒绝——它们需要发布方节点终止该 leg，属于反向服务路径。
+- **反向访问已打通**：`ServiceExit` 与 `NodeExit` 现在真正搬运流量。Hub 在发布方节点的会话上新开一条流并把调用方的目标**原样透传**，发布方按自己的 `[[services]]` 表解析后拨本地目标，两条 leg 由 Hub 桥接；调用方只在发布方报 `OpenResult{Ok}` 且 `Ready` 之后才收到成功（§7.1）。既有门禁全部保持原样，没有为接通而放宽任何 ACL。只有多跳 `Relay` 仍以明确原因拒绝。
 - **节点侧没有 WebSocket 载体**（上行 POST + 下行 SSE），UDP ASSOCIATE 与重连退避监督未实现。
+- 节点的 `NodeAddressTarget` 本地策略目前是**编译期默认拒绝**，operator 可配置的 allowlist 尚未接线（`InboundPolicy` 已就位并有测试覆盖）。
 - `services list` 只报告本节点发布的条目：节点的 `ServiceDirectory` 只支持 `contains` 查询，不支持枚举，因此没有伪造远端目录列表。
 - 未做 nginx / TLS 实机验证；`wsnet-limits` 的 DoS 预算未压测。
 
