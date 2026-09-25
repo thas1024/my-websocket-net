@@ -11,7 +11,7 @@
 //! * an unconfirmed `Open` is never redone on another Hub, which is why
 //!   [`NodeRuntime::open_flow`] selects a Hub once and lets the failure surface.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -25,7 +25,9 @@ use tracing::{debug, info, warn};
 use wsnet_config::{ClientConfig, ConfigError, ForwardConfig};
 use wsnet_crypto::Psk;
 use wsnet_forward::{ForwardError, ForwardManager};
-use wsnet_limits::{KEEPALIVE_INTERVAL_SECS, PSK_LEN};
+use wsnet_limits::{
+    KEEPALIVE_INTERVAL_SECS, PSK_LEN, RECONNECT_BACKOFF_MAX_SECS, RECONNECT_BACKOFF_MIN_SECS,
+};
 use wsnet_operation::OperationError;
 use wsnet_protocol::CanonError;
 use wsnet_routing::{Destination, Proto};
@@ -252,6 +254,8 @@ pub struct NodeRuntime {
     transport: Arc<dyn TransportFactory>,
     hello_timeout: Duration,
     hubs: Mutex<BTreeMap<String, Arc<HubSession>>>,
+    /// Hubs that already have a supervisor, so one is never started twice.
+    supervised: Mutex<BTreeSet<String>>,
     forwards: Mutex<Option<Arc<ForwardManager>>>,
     socks_addr: Mutex<Option<SocketAddr>>,
     shutdown: watch::Sender<bool>,
@@ -302,7 +306,17 @@ impl NodeRuntime {
     ///
     /// The handshake error of that Hub, including a bad `AuthOk` MAC, and
     /// [`NodeError::HelloTimeout`] when the barrier never lifts.
-    pub async fn connect_hub(&self, hub_id: &str) -> Result<Arc<HubSession>, NodeError> {
+    pub async fn connect_hub(self: &Arc<Self>, hub_id: &str) -> Result<Arc<HubSession>, NodeError> {
+        let session = self.establish(hub_id).await?;
+        self.supervise(hub_id, Some(Arc::clone(&session)));
+        Ok(session)
+    }
+
+    /// Establishes one Hub session without starting a supervisor.
+    ///
+    /// Split out so the supervisor can reconnect without spawning a second
+    /// supervisor for the same Hub.
+    async fn establish(&self, hub_id: &str) -> Result<Arc<HubSession>, NodeError> {
         let plan = self
             .plans
             .iter()
@@ -325,8 +339,89 @@ impl NodeRuntime {
         .await?;
         session.wait_ready(self.hello_timeout).await?;
         lock(&self.hubs).insert(hub_id.to_string(), Arc::clone(&session));
-        self.spawn_health_loop(hub_id.to_string(), Arc::clone(&session));
         Ok(session)
+    }
+
+    /// Keeps one Hub connected, reconnecting it after a failure (section 5.5).
+    ///
+    /// At most one supervisor exists per Hub id: a Hub that is already supervised
+    /// is left alone, so an explicit `connect_hub` cannot start a second loop that
+    /// fights the first.
+    fn supervise(self: &Arc<Self>, hub_id: &str, session: Option<Arc<HubSession>>) {
+        if !lock(&self.supervised).insert(hub_id.to_string()) {
+            return;
+        }
+        let runtime = Arc::clone(self);
+        let hub_id = hub_id.to_string();
+        let mut shutdown = self.subscribe();
+        tokio::spawn(async move {
+            let mut current = session;
+            let mut backoff = RECONNECT_BACKOFF_MIN_SECS;
+            loop {
+                // Supervise the live session until it ends or we are stopped.
+                if let Some(session) = current.take() {
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)) => {}
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    return;
+                                }
+                                continue;
+                            }
+                        }
+                        if session.state() == SessionState::Closed {
+                            break;
+                        }
+                        if let Err(error) = session.health_check().await {
+                            debug!(hub = %hub_id, %error, "hub health check failed");
+                        }
+                    }
+                }
+
+                if *shutdown.borrow() {
+                    return;
+                }
+                // Section 5.5: a Hub with no live session is withdrawn from
+                // selection, so new flows are not pointed at a dead Hub.
+                lock(&runtime.hubs).remove(&hub_id);
+
+                let pause = backoff.saturating_add(Self::reconnect_jitter(backoff));
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(pause)) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return;
+                        }
+                        return;
+                    }
+                }
+
+                match runtime.establish(&hub_id).await {
+                    Ok(session) => {
+                        info!(hub = %hub_id, "hub session re-established");
+                        current = Some(session);
+                        backoff = RECONNECT_BACKOFF_MIN_SECS;
+                    }
+                    Err(error) if Self::reconnect_is_terminal(&error) => {
+                        // Section 5.3: a configuration or credential error stops
+                        // the busy retry and leaves a local diagnostic instead.
+                        warn!(
+                            hub = %hub_id,
+                            %error,
+                            "not retrying: the configuration or credentials are wrong"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(hub = %hub_id, %error, "hub reconnect failed");
+                        backoff = backoff
+                            .saturating_mul(2)
+                            .min(RECONNECT_BACKOFF_MAX_SECS);
+                    }
+                }
+            }
+        });
     }
 
     /// Reads or resolves one Hub's pre-shared key.
@@ -340,28 +435,31 @@ impl NodeRuntime {
         }
     }
 
-    /// Keeps one Hub's section 5.5 health verdict current.
-    fn spawn_health_loop(&self, hub_id: String, session: Arc<HubSession>) {
-        let mut shutdown = self.subscribe();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)) => {}
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            return;
-                        }
-                        continue;
-                    }
-                }
-                if session.state() == SessionState::Closed {
-                    return;
-                }
-                if let Err(error) = session.health_check().await {
-                    debug!(hub = %hub_id, %error, "hub health check failed");
-                }
-            }
-        });
+    /// Whether reconnecting could ever help.
+    ///
+    /// Section 5.3 separates a broken link from a broken configuration: a
+    /// rejected handshake or an unusable secret file will fail exactly the same
+    /// way on every attempt, so those stop the supervisor instead of backing off
+    /// forever.
+    fn reconnect_is_terminal(error: &NodeError) -> bool {
+        matches!(
+            error,
+            NodeError::Handshake(_)
+                | NodeError::Secret { .. }
+                | NodeError::UnknownHub { .. }
+                | NodeError::UnsafeSocksListen { .. }
+        )
+    }
+
+    /// Jitter for one reconnect wait, up to a quarter of the backoff.
+    ///
+    /// Every node that lost the same Hub would otherwise retry in lockstep.
+    fn reconnect_jitter(backoff: u64) -> u64 {
+        use rand::Rng as _;
+        if backoff == 0 {
+            return 0;
+        }
+        rand::thread_rng().gen_range(0..=(backoff / 4).max(1))
     }
 
     /// The session a flow must use, applying section 5.5 selection.
@@ -510,6 +608,7 @@ impl Node {
             transport: Arc::clone(&options.transport),
             hello_timeout: options.hello_timeout,
             hubs: Mutex::new(BTreeMap::new()),
+            supervised: Mutex::new(BTreeSet::new()),
             forwards: Mutex::new(None),
             socks_addr: Mutex::new(None),
             shutdown,
@@ -549,6 +648,9 @@ impl Node {
                 }
                 Err(error) => {
                     warn!(hub = %hub_id, %error, "hub session unavailable");
+                    // Section 5.5: a Hub that is down at startup is still worth
+                    // retrying, so it gets a supervisor rather than being dropped.
+                    self.runtime.supervise(&hub_id, None);
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
@@ -789,6 +891,60 @@ mod tests {
         config.client.socks_listen = socks_listen.to_string();
         config.client.allow_from = allow_from;
         config
+    }
+
+    /// Section 5.3: a broken link is retried, a broken configuration is not.
+    #[test]
+    fn only_retryable_failures_are_retried() {
+        let credential = NodeError::Secret {
+            hub_id: "hub-a".to_string(),
+            detail: "unreadable".to_string(),
+        };
+        assert!(
+            NodeRuntime::reconnect_is_terminal(&credential),
+            "a bad secret file fails the same way every time"
+        );
+
+        let handshake = NodeError::Handshake(wsnet_session::HandshakeError::BadMac);
+        assert!(
+            NodeRuntime::reconnect_is_terminal(&handshake),
+            "a rejected handshake must not be retried forever"
+        );
+
+        let unknown = NodeError::UnknownHub {
+            hub_id: "ghost".to_string(),
+        };
+        assert!(
+            NodeRuntime::reconnect_is_terminal(&unknown),
+            "an unconfigured Hub cannot appear by retrying"
+        );
+
+        let transport = NodeError::Transport("connection refused".to_string());
+        assert!(
+            !NodeRuntime::reconnect_is_terminal(&transport),
+            "a Hub that is merely down must be retried"
+        );
+    }
+
+    /// The backoff wait must stay bounded and must not be a fixed value, or every
+    /// node that lost the same Hub would retry in lockstep.
+    #[test]
+    fn reconnect_jitter_is_bounded_and_varies() {
+        assert_eq!(NodeRuntime::reconnect_jitter(0), 0);
+
+        let mut seen = BTreeSet::new();
+        for _ in 0..64 {
+            let jitter = NodeRuntime::reconnect_jitter(RECONNECT_BACKOFF_MAX_SECS);
+            assert!(
+                jitter <= RECONNECT_BACKOFF_MAX_SECS / 4 + 1,
+                "jitter {jitter} exceeded a quarter of the backoff"
+            );
+            seen.insert(jitter);
+        }
+        assert!(
+            seen.len() > 1,
+            "jitter produced a single value across 64 draws"
+        );
     }
 
     /// Section 9.3: a non-loopback listener without credentials and an allowlist
