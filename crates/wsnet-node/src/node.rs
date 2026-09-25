@@ -239,10 +239,14 @@ impl NodeOptions {
     }
 }
 
+use crate::inbound::InboundPolicy;
+
 /// The shared state behind a [`Node`].
 pub struct NodeRuntime {
     node_id: String,
     services: Vec<ServiceRegistration>,
+    /// What an inbound `Open` may reach beyond those services (section 9.3).
+    inbound: InboundPolicy,
     capabilities: Vec<String>,
     plans: Vec<HubPlan>,
     transport: Arc<dyn TransportFactory>,
@@ -314,6 +318,7 @@ impl NodeRuntime {
             self.node_id.clone(),
             psk,
             self.services.clone(),
+            self.inbound.clone(),
             self.capabilities.clone(),
             transport,
         )
@@ -479,10 +484,24 @@ impl Node {
             })
             .collect();
 
+        // The configuration layer already refuses an unusable CIDR, so a failure
+        // here means the config was bypassed. Falling back to deny-all keeps that
+        // fail-closed instead of panicking in a library.
+        let mut inbound = InboundPolicy::deny_all();
+        for cidr in &config.client.allow_node_address {
+            match inbound.clone().allow_node_address(cidr) {
+                Ok(policy) => inbound = policy,
+                Err(detail) => {
+                    tracing::warn!(%detail, "ignoring an unusable node-address allowlist entry");
+                }
+            }
+        }
+
         let (shutdown, _receiver) = watch::channel(false);
         let runtime = Arc::new(NodeRuntime {
             node_id: config.client.node_id.clone(),
             services,
+            inbound,
             capabilities: SUPPORTED_CAPABILITIES
                 .iter()
                 .map(|capability| (*capability).to_string())

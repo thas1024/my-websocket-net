@@ -48,7 +48,9 @@ pub use forward::ForwardBridge;
 pub use health::HealthTracker;
 pub use http::{HttpTransport, HttpTransportFactory};
 pub use hub::HubSession;
-pub use inbound::{resolve_inbound, InboundPolicy, InboundRefusal, ResolvedTarget};
+pub use inbound::{
+    resolve_inbound, InboundPolicy, InboundRefusal, ResolvedTarget,
+};
 pub use node::{FlowOpener, Node, NodeError, NodeOptions, NodeRuntime};
 pub use select::{select_hub, Candidate, HubChoice, ServiceDirectory};
 pub use socks::{destination_for, SocksBridge};

@@ -412,3 +412,145 @@ destination = {{ type = "service", node = "publisher", name = "web" }}
     let _ = std::fs::remove_file(&key_path);
     let _ = std::fs::remove_dir(&scratch);
 }
+
+/// A raw node address works only when the publisher's own allowlist names it.
+///
+/// This is the wiring test for `client.allow_node_address`: the `resolve_inbound`
+/// unit tests cover the predicate, and this covers the path from configuration,
+/// through the node, into the inbound policy. DESIGN.md section 9.3 makes the
+/// publisher's own check the second gate, so the Hub's ACL permitting the
+/// address is not by itself enough.
+#[tokio::test]
+async fn a_publishers_allowlist_admits_an_explicit_node_address() {
+    init_tracing();
+    let scratch = scratch_dir();
+    let key_path = scratch.join("publisher.key");
+    std::fs::write(&key_path, psk_hex()).expect("write the shared key");
+
+    let target = spawn_echo_target().await;
+    let target_port = target.port();
+
+    let hub_listener = bound_loopback().await;
+    let hub_port = hub_listener.local_addr().expect("hub addr").port();
+
+    let server_toml = format!(
+        r#"
+[server]
+hub_id = "hub-a"
+listen = "127.0.0.1:{hub_port}"
+relay_allow = []
+
+[[nodes]]
+id = "publisher"
+key_id = "pub-1"
+secret_file = "{key}"
+
+[[nodes]]
+id = "caller"
+key_id = "call-1"
+secret_file = "{key}"
+
+# The Hub's gate: this caller may reach that address in the publisher's view.
+[[acl]]
+caller = "caller"
+action = "connect_node_address"
+node = "publisher"
+host_cidr = "127.0.0.1/32"
+ports = [{target_port}]
+proto = "tcp"
+allow = true
+"#,
+        key = toml_path(&key_path)
+    );
+    let server_config = ServerConfig::from_toml(&server_toml).expect("server config");
+    let secrets = NodeSecrets::from_server_config(&server_config).expect("secrets");
+    let hub = Arc::new(Hub::new(server_config, secrets).expect("hub"));
+    let hub_task = tokio::spawn(Arc::clone(&hub).serve(hub_listener));
+
+    // The publisher's own gate: without this list the address stays denied, and
+    // this is the configuration field the test exists to exercise.
+    let publisher_socks = free_port().await;
+    let publisher_toml = format!(
+        r#"
+[client]
+node_id = "publisher"
+socks_listen = "127.0.0.1:{publisher_socks}"
+allow_node_address = ["127.0.0.1/32"]
+
+[[servers]]
+hub_id = "hub-a"
+url = "http://127.0.0.1:{hub_port}"
+key_id = "pub-1"
+secret_file = "{key}"
+priority = 1
+
+[router]
+final = "server"
+"#,
+        key = toml_path(&key_path)
+    );
+    let publisher = Node::build(
+        ClientConfig::from_toml(&publisher_toml).expect("publisher config"),
+        NodeOptions::default(),
+    )
+    .expect("publisher");
+    publisher.start().await.expect("start publisher");
+    wait_until_ready(&publisher, "hub-a").await;
+
+    let caller_socks = free_port().await;
+    let caller_toml = format!(
+        r#"
+[client]
+node_id = "caller"
+socks_listen = "127.0.0.1:{caller_socks}"
+
+[[servers]]
+hub_id = "hub-a"
+url = "http://127.0.0.1:{hub_port}"
+key_id = "call-1"
+secret_file = "{key}"
+priority = 1
+
+[router]
+final = "server"
+
+[[forwards]]
+name = "to-addr"
+listen = "127.0.0.1:0"
+proto = "tcp"
+hub = "auto"
+destination = {{ type = "node_address", node = "publisher", host = "127.0.0.1", port = {target_port} }}
+"#,
+        key = toml_path(&key_path)
+    );
+    let caller = Node::build(
+        ClientConfig::from_toml(&caller_toml).expect("caller config"),
+        NodeOptions::default(),
+    )
+    .expect("caller");
+    caller.start().await.expect("start caller");
+    wait_until_ready(&caller, "hub-a").await;
+
+    let listen = caller
+        .forward_addr("to-addr")
+        .expect("the caller's forward listener must be bound");
+
+    let payload = b"raw address";
+    let mut client = timeout(Duration::from_secs(20), TcpStream::connect(listen))
+        .await
+        .expect("connect timed out")
+        .expect("the forward must accept");
+    client.write_all(payload).await.expect("write");
+    let mut echoed = vec![0u8; payload.len()];
+    timeout(Duration::from_secs(20), client.read_exact(&mut echoed))
+        .await
+        .expect("the echo timed out: the allowlisted address was not reached")
+        .expect("the echo must arrive");
+    assert_eq!(&echoed, payload);
+
+    caller.shutdown();
+    publisher.shutdown();
+    hub_task.abort();
+    let _ = std::fs::remove_file(&key_path);
+    let _ = std::fs::remove_dir(&scratch);
+}

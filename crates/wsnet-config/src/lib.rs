@@ -997,6 +997,13 @@ pub struct ClientSection {
     /// default-deny posture; DESIGN.md section 10's sample sets it explicitly.
     #[serde(default)]
     pub udp_enabled: bool,
+    /// CIDRs this node will dial for an inbound `NodeAddressTarget`.
+    ///
+    /// DESIGN.md section 9.3 requires an explicit allowlist before another node
+    /// may reach a raw address in this node's view; the list is empty by default,
+    /// so publishing a service never grants access to anything else on this host.
+    #[serde(default)]
+    pub allow_node_address: Vec<String>,
     /// Largest payload accepted from SOCKS5, leaving room for headers.
     #[serde(default = "default_udp_max_payload")]
     pub udp_max_payload_bytes: usize,
@@ -1012,6 +1019,7 @@ impl Default for ClientSection {
             socks_listen: default_socks_listen(),
             allow_from: Vec::new(),
             udp_enabled: false,
+            allow_node_address: Vec::new(),
             udp_max_payload_bytes: default_udp_max_payload(),
             udp_queue_ttl_ms: default_udp_queue_ttl(),
         }
@@ -1028,6 +1036,16 @@ impl ClientSection {
             &self.allow_from,
             false,
         )?;
+        // Section 9.3: an entry that is not a CIDR could never match, so it is a
+        // load-time error rather than a silently inert rule.
+        for (index, cidr) in self.allow_node_address.iter().enumerate() {
+            if cidr.parse::<IpNet>().is_err() {
+                return Err(ConfigError::InvalidCidr {
+                    field: format!("client.allow_node_address[{index}]"),
+                    value: cidr.clone(),
+                });
+            }
+        }
         if self.udp_max_payload_bytes == 0 || self.udp_max_payload_bytes > MAX_UDP_PAYLOAD {
             return Err(ConfigError::UdpPayloadOutOfRange {
                 field: "client.udp_max_payload_bytes".to_string(),

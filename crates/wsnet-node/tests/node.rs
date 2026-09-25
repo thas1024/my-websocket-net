@@ -126,6 +126,7 @@ async fn hello_ok_gates_ready_and_refuses_an_early_open() {
         "client-a".to_string(),
         psk(),
         Vec::new(),
+        wsnet_node::InboundPolicy::deny_all(),
         capabilities(),
         transport,
     ))
@@ -160,6 +161,7 @@ async fn hello_ok_gates_ready_and_refuses_an_early_open() {
         "client-a".to_string(),
         psk(),
         Vec::new(),
+        wsnet_node::InboundPolicy::deny_all(),
         capabilities(),
         transport,
     ))

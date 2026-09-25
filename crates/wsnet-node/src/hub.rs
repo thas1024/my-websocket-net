@@ -101,6 +101,7 @@ impl HubSession {
         node_id: String,
         psk: Psk,
         services: Vec<ServiceRegistration>,
+        inbound_policy: InboundPolicy,
         capabilities: Vec<String>,
         transport: Arc<dyn HubTransport>,
     ) -> Result<Arc<Self>, NodeError> {
@@ -206,10 +207,7 @@ impl HubSession {
             uplink,
             streams: HashMap::new(),
             services: services.clone(),
-            // Section 9.3 makes raw node-address access default deny, and wiring
-            // an operator-facing allowlist is still outstanding, so this build
-            // permits published services only.
-            policy: InboundPolicy::deny_all(),
+            policy: inbound_policy,
             directory: Arc::clone(&directory),
             operations: Arc::clone(&operations),
             gone: Arc::clone(&gone),
