@@ -303,6 +303,20 @@ impl Sessions {
         self.entries.lock().expect("session mutex").len()
     }
 
+    /// Every live session, cloned for a caller that must fan one record out to all
+    /// of them (section 8's `PeerList`).
+    ///
+    /// The lock is released before the returned vector is used, so a broadcast
+    /// never holds the session table while it sends.
+    pub(crate) fn snapshot(&self) -> Vec<SharedSession> {
+        self.entries
+            .lock()
+            .expect("session mutex")
+            .values()
+            .cloned()
+            .collect()
+    }
+
     /// Sessions whose absolute expiry has passed.
     pub(crate) fn expired(&self, now_wall_secs: i64) -> Vec<SharedSession> {
         self.entries

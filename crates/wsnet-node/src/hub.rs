@@ -458,7 +458,24 @@ impl Driver {
                 event = self.events.recv() => Wake::Event(event),
             };
             match wake {
-                Wake::Command(None) | Wake::Command(Some(Command::Close)) => break,
+                Wake::Command(None) => break,
+                Wake::Command(Some(Command::Close)) => {
+                    // Section 5.5: a deliberate local close is *announced*. If the
+                    // loop merely stopped, the Hub would keep this node's lease and
+                    // its service registrations until the session's TTL expired, so
+                    // a service this node took out of service would still be
+                    // advertised by the directory and still be selected by other
+                    // nodes' `Open`s — which would then never be answered.
+                    if let Err(error) = self.handle.send_bye("closed locally") {
+                        debug!(
+                            hub = %self.handle.config().hub_id,
+                            %error,
+                            "cannot announce the close to the hub"
+                        );
+                    }
+                    self.flush_uplink();
+                    break;
+                }
                 Wake::Command(Some(Command::Open {
                     destination,
                     proto,
@@ -487,6 +504,17 @@ impl Driver {
         self.handle.set_state(SessionState::Closed);
         self.closed.store(true, Ordering::SeqCst);
         self.gone.notify_waiters();
+    }
+
+    /// Moves everything the engine has queued to the uplink carrier.
+    ///
+    /// The driver stops draining `outbound` as soon as it breaks, so the terminal
+    /// `Bye` has to be pushed out explicitly; otherwise it dies in the channel and
+    /// the Hub never learns the session ended.
+    fn flush_uplink(&mut self) {
+        while let Ok(envelope) = self.outbound.try_recv() {
+            self.send_uplink(envelope);
+        }
     }
 
     /// Hands one sealed envelope to the uplink carrier.
@@ -562,10 +590,12 @@ impl Driver {
         let _ = lock(&self.operations).settle(request_id, outcome, now_ms());
     }
 
-    /// Handles an inbound `Open` relayed by the Hub (DESIGN.md section 7.6).
+    /// Handles an inbound `Open` relayed by the Hub (DESIGN.md sections 7.1, 7.6).
     ///
     /// The stream is registered before the task starts, so a `Data` record can
-    /// never arrive for a stream whose socket is not yet being pumped.
+    /// never arrive for a stream whose socket is not yet being pumped. Two outcomes
+    /// are possible: this node is the exit and dials, or it is a hop of a chain and
+    /// has to open the next leg on this same session.
     fn on_inbound_open(&mut self, fields: OpenFields) {
         if self.streams.contains_key(&fields.stream_id) {
             // Section 4.2 forbids reusing a stream id, so a second `Open` for a
@@ -577,9 +607,8 @@ impl Driver {
         }
 
         let node_id = self.handle.config().node_id.clone();
-        let resolved = match inbound::resolve_inbound(&node_id, &self.services, &self.policy, &fields)
-        {
-            Ok(target) => target,
+        let plan = match inbound::plan_inbound(&node_id, &self.services, &self.policy, &fields) {
+            Ok(plan) => plan,
             Err(refusal) => {
                 debug!(
                     stream = fields.stream_id,
@@ -608,14 +637,81 @@ impl Driver {
                 request_id: fields.request_id,
             },
         );
+
+        match plan {
+            inbound::InboundPlan::Dial(target) => {
+                let handle = self.handle.clone();
+                tokio::spawn(inbound::serve_inbound(
+                    handle,
+                    fields.request_id,
+                    fields.stream_id,
+                    target,
+                    rx,
+                ));
+            }
+            inbound::InboundPlan::Forward => {
+                self.relay_chain_leg(fields, rx);
+            }
+        }
+    }
+
+    /// Opens the next leg of a chain on this session and bridges the two halves.
+    ///
+    /// Section 7.1 keeps a chain on one Hub, so the next leg is opened on *this*
+    /// session rather than through Hub selection: choosing a Hub here could move
+    /// the chain somewhere the caller's ACL never permitted. The leg carries the
+    /// destination and the hops still to run, so the Hub authorises the next edge
+    /// exactly as it authorised this one.
+    fn relay_chain_leg(&mut self, fields: OpenFields, inbound_rx: mpsc::UnboundedReceiver<StreamMsg>) {
+        let leg = inbound::ChainLeg {
+            destination: fields.destination.clone(),
+            via: fields.via.clone(),
+            proto: fields.proto,
+        };
+        let request_id = fields.request_id;
+        let stream_id = fields.stream_id;
+
+        // The next leg goes through the ordinary `Open` path, so it gets the same
+        // operation-table idempotency and open deadline as any other flow.
+        let (reply, answer) = oneshot::channel();
+        let next_request = fresh_session_id();
+        self.begin_open(
+            leg.destination.clone(),
+            leg.proto,
+            leg.via.clone(),
+            next_request,
+            reply,
+        );
+
         let handle = self.handle.clone();
-        tokio::spawn(inbound::serve_inbound(
-            handle,
-            fields.request_id,
-            fields.stream_id,
-            resolved,
-            rx,
-        ));
+        let inbound = SessionStream::new(handle.clone(), stream_id, inbound_rx);
+        tokio::spawn(async move {
+            match answer.await {
+                Ok(Ok(next)) => {
+                    inbound::relay_leg(handle, request_id, stream_id, inbound, next).await;
+                }
+                Ok(Err(error)) => {
+                    // The next leg could not be opened, so the caller's `Open` is
+                    // answered with that failure instead of a stream that does not
+                    // exist. Section 9.1 keeps the reason local; the status is what
+                    // the caller needs.
+                    debug!(%stream_id, %error, "the next chain leg could not be opened");
+                    let result = OpenResultFields {
+                        request_id,
+                        stream_id,
+                        status: match error {
+                            NodeError::OpenFailed { status, .. } => status,
+                            _ => OpenStatus::Unreachable,
+                        },
+                        detail: "the next hop of the chain refused the stream".to_string(),
+                    };
+                    let _ = handle.send_open_result(&result);
+                }
+                Err(_) => {
+                    debug!(%stream_id, "the driver ended before the next leg was opened");
+                }
+            }
+        });
     }
 
     fn on_event(&mut self, event: SessionEvent) {
@@ -638,13 +734,21 @@ impl Driver {
                 self.deliver(fields.stream_id, StreamMsg::Credit);
             }
             SessionEvent::PeerList(value) => {
-                let directory = ServiceDirectory::from_peer_list(&value);
+                let mut directory = lock(&self.directory);
+                // Section 8: a snapshot that is not newer is dropped, so a
+                // retransmitted old one cannot resurrect a withdrawn service.
+                if !directory.apply_peer_list(&value) {
+                    debug!(
+                        hub = %self.handle.config().hub_id,
+                        "ignored a peer list that is not newer than the applied one"
+                    );
+                    return;
+                }
                 debug!(
                     hub = %self.handle.config().hub_id,
                     services = directory.len(),
                     "hub peer list received"
                 );
-                *lock(&self.directory) = directory;
             }
             SessionEvent::Ping => {
                 let _ = self.handle.send_pong();

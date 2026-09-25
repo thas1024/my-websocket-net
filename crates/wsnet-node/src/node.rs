@@ -39,7 +39,6 @@ use wsnet_socks::{IpPrefix, Socks5Server, SocksConfig, SocksError, UserPass};
 
 use crate::endpoint::{HubEndpoint, HubTransport, TransportFactory};
 use crate::forward::{choice_of, spec_of, ForwardBridge};
-use crate::http::HttpTransportFactory;
 use crate::hub::HubSession;
 use crate::select::{select_hub, Candidate, HubChoice};
 use crate::socks::SocksBridge;
@@ -209,7 +208,10 @@ impl Default for NodeOptions {
         NodeOptions {
             socks_userpass: None,
             psk_overrides: HashMap::new(),
-            transport: Arc::new(HttpTransportFactory::default()),
+            // The shipped carrier pair, chosen through the same mapping the
+            // configuration uses so `Auto` cannot drift between the two call
+            // sites (DESIGN.md section 6.1).
+            transport: crate::ws::factory_for(wsnet_config::ClientCarrier::Auto),
             hello_timeout: Duration::from_secs(10),
         }
     }
@@ -220,6 +222,15 @@ impl NodeOptions {
     pub fn with_transport(mut self, transport: Arc<dyn TransportFactory>) -> Self {
         self.transport = transport;
         self
+    }
+
+    /// Selects the carrier family the configuration asked for.
+    ///
+    /// DESIGN.md section 6.1 lets a deployment move both directions onto the
+    /// `GET /w` WebSocket, so the choice belongs to configuration rather than to
+    /// a caller that would have to know a transport type.
+    pub fn with_carrier(self, carrier: wsnet_config::ClientCarrier) -> Self {
+        self.with_transport(crate::ws::factory_for(carrier))
     }
 
     /// Sets the RFC 1929 credentials for the SOCKS5 listener.
@@ -602,6 +613,9 @@ impl Node {
                 }
             }
         }
+        // Section 7.1: whether this node will carry another caller's chain onward is
+        // its own decision, separate from the Hub's per-edge `relay` permit.
+        let inbound = inbound.with_relay_forward(config.client.relay_forward);
 
         let (shutdown, _receiver) = watch::channel(false);
         let runtime = Arc::new(NodeRuntime {
@@ -681,6 +695,15 @@ impl Node {
     /// The live session for a Hub.
     pub fn session(&self, hub_id: &str) -> Option<Arc<HubSession>> {
         self.runtime.hub(hub_id)
+    }
+
+    /// What a Hub has advertised to this node in its `PeerList` (section 8).
+    ///
+    /// `None` means this Hub has not been reached at all; a *known* but empty
+    /// directory is the Hub's positive statement that nothing is visible to this
+    /// caller, which is why the two are not collapsed here.
+    pub fn directory(&self, hub_id: &str) -> Option<crate::ServiceDirectory> {
+        self.runtime.directory(hub_id)
     }
 
     /// The local SOCKS5 address actually bound.

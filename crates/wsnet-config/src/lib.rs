@@ -975,6 +975,31 @@ impl ClientConfig {
     }
 }
 
+/// The carrier family a node uses to reach a Hub (DESIGN.md section 6.1).
+///
+/// Section 6.1 allows client-to-server data over a WebSocket or over HTTPS
+/// `POST`, and section 6.2 allows server-to-client data over a WebSocket, SSE, or
+/// a bounded `POST` response. The choice is the deployment's, because a network
+/// that disables one of the two server endpoints leaves only the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientCarrier {
+    /// Keep the shipped `POST /m` uplink plus `GET /e` downlink pair.
+    Auto,
+    /// The same pair, named explicitly.
+    Post,
+    /// One `GET /w` WebSocket, carrying both directions on one socket.
+    Ws,
+}
+
+impl Default for ClientCarrier {
+    /// `Auto` is the shipped behaviour, so an existing document keeps working
+    /// unchanged when this field appears.
+    fn default() -> Self {
+        ClientCarrier::Auto
+    }
+}
+
 /// The `[client]` table (DESIGN.md section 10).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -985,6 +1010,13 @@ pub struct ClientSection {
     /// Address the local SOCKS5 listener binds.
     #[serde(default = "default_socks_listen")]
     pub socks_listen: String,
+    /// Carrier family used to reach every Hub.
+    ///
+    /// Defaults to the shipped `POST /m` plus `GET /e` pair; a deployment whose
+    /// network disables `POST /m` sets `carrier = "ws"` to move both directions
+    /// onto `GET /w`.
+    #[serde(default)]
+    pub carrier: ClientCarrier,
     /// Source CIDRs permitted to use the SOCKS listener.
     ///
     /// Required whenever `socks_listen` is not loopback; see USAGE.md section 12
@@ -1004,6 +1036,15 @@ pub struct ClientSection {
     /// so publishing a service never grants access to anything else on this host.
     #[serde(default)]
     pub allow_node_address: Vec<String>,
+    /// Whether this node will carry another caller's multi-hop chain onward.
+    ///
+    /// DESIGN.md section 7.1 makes a chain a star-shaped return path, so an
+    /// intermediate node relays traffic for destinations it never published. That
+    /// is a distinct capability from being an exit, and it is off by default: the
+    /// Hub's `relay` ACL is the per-edge permit, and section 9.3's "出口节点独立
+    /// 校验本地策略" makes the node's own consent a second, separate decision.
+    #[serde(default)]
+    pub relay_forward: bool,
     /// Largest payload accepted from SOCKS5, leaving room for headers.
     #[serde(default = "default_udp_max_payload")]
     pub udp_max_payload_bytes: usize,
@@ -1017,9 +1058,11 @@ impl Default for ClientSection {
         ClientSection {
             node_id: default_node_id(),
             socks_listen: default_socks_listen(),
+            carrier: ClientCarrier::default(),
             allow_from: Vec::new(),
             udp_enabled: false,
             allow_node_address: Vec::new(),
+            relay_forward: false,
             udp_max_payload_bytes: default_udp_max_payload(),
             udp_queue_ttl_ms: default_udp_queue_ttl(),
         }
@@ -1738,11 +1781,33 @@ allow = true
         assert_eq!(section, DecoySection::default());
     }
 
+    /// DESIGN.md section 6.1: the carrier family is a deployment choice, and
+    /// omitting it must keep the shipped `POST /m` plus `GET /e` pair.
+    #[test]
+    fn the_client_carrier_defaults_to_auto_and_parses_ws() {
+        let default = ClientConfig::from_toml("").expect("an empty document must parse");
+        assert_eq!(default.client.carrier, ClientCarrier::Auto);
+
+        let ws =
+            ClientConfig::from_toml("[client]\ncarrier = \"ws\"\n").expect("carrier = \"ws\"");
+        assert_eq!(ws.client.carrier, ClientCarrier::Ws);
+
+        let post =
+            ClientConfig::from_toml("[client]\ncarrier = \"post\"\n").expect("carrier = \"post\"");
+        assert_eq!(post.client.carrier, ClientCarrier::Post);
+
+        // The field's serde default and the manual `Default` impl must agree, so
+        // an omitted field and an omitted table cannot differ.
+        let section: ClientSection = toml::from_str("").unwrap();
+        assert_eq!(section.carrier, ClientCarrier::Auto);
+    }
+
     // ------------------------------------------------------------ auth window
 
     #[test]
     fn auth_window_bounds_are_enforced() {
         let doc = |secs: u64| format!("[server]\nhub_id = \"hub-a\"\nauth_window_secs = {secs}\n");
+
         assert_eq!(
             server_err(&doc(AUTH_WINDOW_MIN_SECS - 1)),
             ConfigError::AuthWindowOutOfRange {

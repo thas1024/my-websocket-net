@@ -611,12 +611,29 @@ async fn post_auth_returns_authok_and_the_derived_keys_verify_a_follow_up_record
         );
 
         let records = node.reply_records(&response);
-        assert_eq!(records.len(), 1, "Hello is answered with one record");
+        assert_eq!(
+            records.len(),
+            2,
+            "a registration is answered with HelloOk and the caller's PeerList"
+        );
         assert_eq!(records[0].kind, MessageKind::HelloOk);
         assert_eq!(
             records[0].metadata.get_str("request_id").unwrap(),
             "31".repeat(16)
         );
+        // Section 8: the barrier and the directory arrive together, so a caller
+        // that has seen `HelloOk` may already rely on the snapshot it was given.
+        // The snapshot is scoped to this caller, and this node has no ACL rule
+        // letting it reach even its own service, so the list is *known* and empty
+        // rather than absent.
+        assert_eq!(records[1].kind, MessageKind::PeerList);
+        assert_eq!(records[1].metadata.get_str("hub").unwrap(), HUB_ID);
+        assert!(records[1].metadata.get_str("version").is_ok());
+        assert!(records[1]
+            .metadata
+            .get_array("services")
+            .expect("a services array")
+            .is_empty());
         assert!(server.hub.is_node_registered(NODE_ID));
         assert_eq!(server.hub.registered_services(NODE_ID), vec!["web"]);
     })
@@ -1021,8 +1038,12 @@ async fn via_chains_are_validated_and_never_silently_ignored() {
         assert_eq!(too_long.status, OpenStatus::Denied);
         assert!(too_long.detail.contains("budget"), "{}", too_long.detail);
 
-        // A valid, fully permitted chain is refused rather than dialled: the Hub
-        // never silently drops the intermediate hops.
+        // A valid, fully permitted chain is no longer refused as unimplemented:
+        // the Hub resolves the first hop and bridges to it. `hop1` has no live
+        // session in this test, so the answer is `Offline` naming that fact, which
+        // is the evidence that the chain reached the bridge rather than being
+        // rejected up front. A chain with a live hop is exercised end to end by
+        // `crates/wsnet-node/tests/multihop.rs`.
         let relayed = node
             .open(
                 &server,
@@ -1031,8 +1052,17 @@ async fn via_chains_are_validated_and_never_silently_ignored() {
                 5,
             )
             .await;
-        assert_eq!(relayed.status, OpenStatus::Refused);
-        assert!(relayed.detail.contains("multi-hop"), "{}", relayed.detail);
+        assert_eq!(
+            relayed.status,
+            OpenStatus::Offline,
+            "a bridgeable chain must resolve its first hop: {}",
+            relayed.detail
+        );
+        assert!(
+            relayed.detail.contains("no live session"),
+            "{}",
+            relayed.detail
+        );
     })
     .await;
 }

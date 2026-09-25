@@ -2025,6 +2025,7 @@ dependencies = [
  "wsnet-control",
  "wsnet-crypto",
  "wsnet-node",
+ "wsnet-routing",
  "wsnet-session",
 ]
 
@@ -2121,6 +2122,12 @@ dependencies = [
 [[package]]
 name = "wsnet-limits"
 version = "0.1.0"
+dependencies = [
+ "wsnet-auth-store",
+ "wsnet-protocol",
+ "wsnet-stream",
+ "wsnet-transport",
+]
 
 [[package]]
 name = "wsnet-node"

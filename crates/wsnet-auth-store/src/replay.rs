@@ -380,3 +380,34 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial budget check, appended for `crates/wsnet-limits/tests/budgets.rs`
+// ---------------------------------------------------------------------------
+//
+// The integration suite drives the window's *behaviour*, and asserts its
+// declared capacity through the public `memory_bytes()` accessor. The bitmap
+// that counts entries is private, so the exact slot count can only be observed
+// here, in the owning crate.
+
+/// §4.2: the window owns exactly `REPLAY_WINDOW` slots and cannot grow.
+#[cfg(test)]
+mod budget_slots {
+    use super::*;
+
+    #[test]
+    fn slot_count_never_exceeds_the_declared_capacity() {
+        let mut window = ReplayWindow::new();
+        // One bit per slot, so the entry count is `words * 64`.
+        assert_eq!(window.seen.len(), WORDS);
+        assert_eq!(window.seen.len() * 64, REPLAY_WINDOW as usize);
+
+        // Four windows' worth of packets must not add a single slot.
+        for n in 0..(REPLAY_WINDOW * 4) {
+            let _ = window.check_and_record(n);
+        }
+        assert_eq!(window.seen.len(), WORDS);
+        assert!(window.seen.len() * 64 <= REPLAY_WINDOW as usize);
+        assert_eq!(window.highest(), Some(REPLAY_WINDOW * 4 - 1));
+    }
+}

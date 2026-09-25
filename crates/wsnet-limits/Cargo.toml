@@ -8,3 +8,11 @@ repository.workspace = true
 description = "wsnet shared budget and bound constants (DESIGN.md §4.1, §5, §7.4, §7.5)"
 
 [dependencies]
+
+[dev-dependencies]
+# The adversarial budget suite (`tests/budgets.rs`) drives the budgets declared
+# here through the structures that are supposed to enforce them.
+wsnet-auth-store.workspace = true
+wsnet-protocol.workspace = true
+wsnet-stream.workspace = true
+wsnet-transport.workspace = true

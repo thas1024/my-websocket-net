@@ -37,8 +37,8 @@ use wsnet_auth_store::{AuthStoreError, NonceKey, NonceStore, NonceStoreConfig, N
 use wsnet_config::{ServerConfig, ServerSection};
 use wsnet_crypto::Psk;
 use wsnet_limits::BIND_PROOF_TTL_SECS;
-use wsnet_protocol::{MessageKind, Record};
-use wsnet_registry::Registry;
+use wsnet_protocol::{Canonical, MessageKind, Record};
+use wsnet_registry::{PeerList, Registry};
 use wsnet_routing::{validate_chain, AclQuery, AclTable, Destination, RelayAllow, RouteError};
 use wsnet_session::{
     authok_mac, fresh_epoch, fresh_nonce, fresh_session_id, negotiate_capabilities, session_keys,
@@ -91,7 +91,6 @@ const DETAIL_RELAY_ACL_DENIED: &str = "no acl rule permits relaying through this
 const DETAIL_SERVICE_OFFLINE: &str = "the publishing node has no live lease on this hub";
 const DETAIL_SERVICE_PROTO: &str = "the published service protocol differs from the open";
 const DETAIL_SERVICE_STALE: &str = "the pinned service revision is stale";
-const DETAIL_RELAY_UNIMPLEMENTED: &str = "multi-hop relay is not implemented in this build";
 
 /// The exit leg an `Open` resolved to.
 ///
@@ -633,18 +632,57 @@ impl Hub {
         // task loses its sink and frees its target socket.
         entry.close_streams();
         let node_id = entry.node_id.clone();
-        match self
-            .registry
-            .lock()
-            .expect("registry mutex")
-            .unregister(&node_id, session_id, epoch)
-        {
-            Ok(true) => tracing::debug!(%node_id, reason, "node lease released"),
-            Ok(false) => tracing::debug!(
+        let released = matches!(
+            self.registry
+                .lock()
+                .expect("registry mutex")
+                .unregister(&node_id, session_id, epoch),
+            Ok(true)
+        );
+        match released {
+            true => tracing::debug!(%node_id, reason, "node lease released"),
+            false => tracing::debug!(
                 %node_id,
                 "a newer lease owns this node; leaving it registered"
             ),
-            Err(_) => {}
+        }
+        // A node that left is a change to every other node's view (section 8), so
+        // the surviving sessions are told; a teardown that released nothing
+        // changed nothing and sends nothing.
+        if released {
+            self.broadcast_peer_lists();
+        }
+    }
+
+    /// Sends every ready session the `PeerList` snapshot it is entitled to see
+    /// (section 8).
+    ///
+    /// Section 4.1 makes `PeerList` a *versioned* snapshot "scoped to what the
+    /// caller may see", so the per-caller filtering happens here, in
+    /// `Registry::peer_list`, and never in the receiver: a node must not be able
+    /// to learn about a service its own ACL rules would refuse. A session that has
+    /// not registered is skipped rather than sent an empty truth, because
+    /// `PeerList` is only meaningful once a lease exists.
+    pub fn broadcast_peer_lists(&self) {
+        for entry in self.sessions.snapshot() {
+            if entry.is_closed() {
+                continue;
+            }
+            let list = self
+                .registry
+                .lock()
+                .expect("registry mutex")
+                .peer_list(&entry.node_id, &self.acl);
+            let metadata = peer_list_canonical(&list);
+            if let Err(error) = entry.handle.send_peer_list(metadata) {
+                tracing::debug!(
+                    session = %hex::encode(entry.session_id),
+                    %error,
+                    "cannot send a peer list"
+                );
+                continue;
+            }
+            entry.flush_outbound();
         }
     }
 
@@ -1031,7 +1069,14 @@ impl Hub {
         if let Err(error) = entry.handle.send_hello_ok(&hello_ok) {
             tracing::warn!(node = %entry.node_id, %error, "cannot answer Hello");
             self.close_session(&entry.session_id, &entry.epoch, "hello failed");
+            return;
         }
+        entry.flush_outbound();
+        // Section 8: registration changed the directory, so every session — the
+        // newcomer included — gets a snapshot of what it may now discover. Sending
+        // it here rather than on a timer keeps the barrier's guarantee: a caller
+        // that has seen `HelloOk` may already rely on the directory it was given.
+        self.broadcast_peer_lists();
     }
 
     /// Turns an `Open` into an `OpenResult`, authorising before anything else.
@@ -1041,9 +1086,12 @@ impl Hub {
     /// the carrier that delivered the `Open` (section 7.1's ten-second leg
     /// budget). An authorised [`ExitPlan::ServiceExit`] or
     /// [`ExitPlan::NodeExit`] is handed to the relay bridge, which terminates the
-    /// leg on the publishing node's own session for the same reason. Multi-hop
-    /// [`ExitPlan::Relay`] is refused here with a detail that names the missing
-    /// piece rather than pretending the stream exists.
+    /// leg on the publishing node's own session for the same reason.
+    ///
+    /// An authorised [`ExitPlan::Relay`] is bridged to the *first* hop with the
+    /// remaining chain attached to that leg's own `Open`, which is what makes the
+    /// star-shaped return path of section 7.1 work: the hop hands the flow back
+    /// here rather than dialling the target itself.
     fn on_open(&self, entry: &SharedSession, fields: OpenFields) {
         match self.authorize_open(&entry.node_id, &fields) {
             Ok(ExitPlan::HubExit { host, port }) => {
@@ -1055,13 +1103,9 @@ impl Hub {
             Ok(ExitPlan::ServiceExit { node_id, .. }) | Ok(ExitPlan::NodeExit { node_id, .. }) => {
                 crate::relay::spawn_relay(self, entry, &fields, &node_id);
             }
-            Ok(ExitPlan::Relay { .. }) => {
-                self.refuse_open(
-                    entry,
-                    &fields,
-                    OpenStatus::Refused,
-                    DETAIL_RELAY_UNIMPLEMENTED,
-                );
+            // Section 7.1's chain: the first hop is asked to continue the path.
+            Ok(ExitPlan::Relay { hops }) => {
+                crate::relay::spawn_relay_chain(self, entry, &fields, &hops);
             }
             Err(refusal) => self.refuse_open(entry, &fields, refusal.status, refusal.detail),
         }
@@ -1240,6 +1284,36 @@ impl Hub {
             }),
         }
     }
+}
+
+/// Builds the canonical `PeerList` metadata a node's directory reads (section 8).
+///
+/// The shape is the one the node parses —
+/// `{"hub":..,"services":[{"name":..,"node":..,"proto":..,"revision":..}],"version":..}`
+/// — and it is built from [`Registry::peer_list`], so it already contains only
+/// what that caller may discover. The list is a routing hint, never a
+/// permission: the Hub still authorises every `Open` on its own.
+///
+/// Both revisions are unsigned, so they use `Canonical::u64_decimal`: section 4.1
+/// carries signature-relevant unsigned integers as decimal strings, and a value
+/// written as a JSON number would be rejected by the reader.
+pub(crate) fn peer_list_canonical(list: &PeerList) -> Canonical {
+    let mut services = Vec::new();
+    for node in &list.nodes {
+        for service in &node.services {
+            services.push(Canonical::object([
+                ("name", Canonical::str(service.service_name.clone())),
+                ("node", Canonical::str(service.node_id.clone())),
+                ("proto", Canonical::str(service.proto.as_str())),
+                ("revision", Canonical::u64_decimal(service.revision)),
+            ]));
+        }
+    }
+    Canonical::object([
+        ("hub", Canonical::str(list.hub_id.clone())),
+        ("services", Canonical::Array(services)),
+        ("version", Canonical::u64_decimal(list.revision)),
+    ])
 }
 
 /// Why a `BindProof` was refused.
@@ -1705,5 +1779,63 @@ mod tests {
         assert!(!hub.is_node_registered("client-a"));
         assert_eq!(hub.registered_node_count(), 0);
         assert_eq!(hub.session_count(), 0);
+    }
+
+    /// Section 8: the snapshot a node's directory reads carries the fields it
+    /// parses, and it is filtered by the caller's own ACL rather than handed out
+    /// whole.
+    #[test]
+    fn the_peer_list_snapshot_is_canonical_and_acl_scoped() {
+        let hub = hub_with(
+            vec![rule(
+                "client-b",
+                AclAction::ConnectService,
+                Some("client-a"),
+                Some("web"),
+            )],
+            vec![],
+        );
+        {
+            let mut registry = hub.registry.lock().expect("registry mutex");
+            assert!(!registry.register_ready("client-a", SID, EPOCH));
+            registry
+                .publish("client-a", &SID, &EPOCH, "web", RouteProto::Tcp, "127.0.0.1:80")
+                .expect("the service must publish");
+        }
+
+        let permitted = hub
+            .registry
+            .lock()
+            .expect("registry mutex")
+            .peer_list("client-b", &hub.acl);
+        let document = peer_list_canonical(&permitted);
+        let services = document.get_array("services").expect("a services array");
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].get_str("node").unwrap(), "client-a");
+        assert_eq!(services[0].get_str("name").unwrap(), "web");
+        assert_eq!(services[0].get_str("proto").unwrap(), "tcp");
+        assert!(services[0].get_u64("revision").is_ok());
+        assert_eq!(document.get_str("hub").unwrap(), "hub-a");
+        assert!(document.get_u64("version").is_ok());
+
+        // The canonical form is a wire contract, so it must survive the encoder
+        // the carrier actually uses, byte for byte.
+        let bytes = document.to_bytes();
+        assert_eq!(Canonical::from_bytes(&bytes).expect("decodable"), document);
+        assert!(Canonical::is_canonical(&bytes).expect("checkable"));
+
+        // A caller with no rule sees an empty snapshot, never the full directory:
+        // section 9.3 makes an unlisted service indistinguishable from an absent
+        // one, so the Hub must not send it at all.
+        let stranger = hub
+            .registry
+            .lock()
+            .expect("registry mutex")
+            .peer_list("client-c", &hub.acl);
+        let stranger_document = peer_list_canonical(&stranger);
+        assert!(stranger_document
+            .get_array("services")
+            .expect("a services array")
+            .is_empty());
     }
 }

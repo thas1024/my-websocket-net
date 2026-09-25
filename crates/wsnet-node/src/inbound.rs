@@ -27,7 +27,7 @@ use wsnet_session::{
     OpenFields, OpenResultFields, OpenStatus, ResetReason, ServiceRegistration, SessionHandle,
 };
 
-use crate::stream::StreamMsg;
+use crate::stream::{SessionStream, StreamMsg};
 
 /// How much a single read from the local target may carry.
 const READ_CHUNK: usize = 16 * 1024;
@@ -67,6 +67,15 @@ impl InboundRefusal {
 #[derive(Debug, Clone, Default)]
 pub struct InboundPolicy {
     allow_node_address: Vec<IpNet>,
+    /// Whether this node will act as an intermediate hop of another caller's
+    /// chain (DESIGN.md section 7.1).
+    ///
+    /// Default deny, and deliberately separate from the Hub's own `relay` ACL:
+    /// carrying someone else's traffic makes this node a hop for destinations it
+    /// never published, so section 9.3's "出口节点独立校验本地策略" applies to the
+    /// node's own consent as well as to the Hub's per-edge permit. A node with
+    /// `relay_forward` off refuses every chain leg it did not publish itself.
+    relay_forward: bool,
 }
 
 impl InboundPolicy {
@@ -84,6 +93,17 @@ impl InboundPolicy {
         Ok(self)
     }
 
+    /// Records whether this node consents to being an intermediate hop.
+    pub fn with_relay_forward(mut self, allowed: bool) -> Self {
+        self.relay_forward = allowed;
+        self
+    }
+
+    /// Whether this node will continue another caller's chain (section 7.1).
+    pub fn relays_forward(&self) -> bool {
+        self.relay_forward
+    }
+
     /// Whether this node may dial `host` for a `NodeAddressTarget`.
     ///
     /// A hostname is not an address, so it cannot be checked against a CIDR and
@@ -97,6 +117,82 @@ impl InboundPolicy {
                 .any(|net| net.contains(&ip)),
             Err(_) => false,
         }
+    }
+}
+
+/// What this node should do with an inbound `Open`.
+///
+/// Section 7.1's chain is a star-shaped return path: `via=[A,B]` means
+/// client→H→A→H→B→target, so a node that was handed a leg with hops left is not an
+/// exit at all — it must hand the flow *back* to the Hub. That is a different
+/// action from dialling, which is why the decision is a type rather than a flag on
+/// [`ResolvedTarget`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundPlan {
+    /// Dial a local target: this node is the chain's exit.
+    Dial(ResolvedTarget),
+    /// Continue the chain through the Hub, because this node is a hop.
+    Forward,
+}
+
+/// Decides between exiting and continuing a chain (DESIGN.md sections 7.1, 7.6).
+///
+/// The rule is a single question: does this leg name *this* node as the end? A leg
+/// whose `via` is non-empty has hops left by construction, and a leg whose
+/// destination names another node is a service or address that belongs to that
+/// node — in both cases this node is a hop, never the exit. Everything else is the
+/// existing reverse-access resolution in [`resolve_inbound`], which is where the
+/// caller-invisible local policy lives.
+pub fn plan_inbound(
+    node_id: &str,
+    services: &[ServiceRegistration],
+    policy: &InboundPolicy,
+    fields: &OpenFields,
+) -> Result<InboundPlan, InboundRefusal> {
+    let continue_chain = |what: &str| {
+        if policy.relays_forward() {
+            Ok(InboundPlan::Forward)
+        } else {
+            Err(InboundRefusal::new(
+                OpenStatus::Denied,
+                format!("{what}, and this node does not relay for other callers"),
+            ))
+        }
+    };
+
+    // Section 7.1: a hop is told the rest of the chain in the leg's own `via`.
+    if !fields.via.is_empty() {
+        return continue_chain("the open still has hops to run");
+    }
+
+    match &fields.destination {
+        // The Hub sends a leg to the node it names as the exit, so any other name
+        // is someone else's destination and this node is only a hop.
+        wsnet_routing::Destination::Service { node, .. }
+        | wsnet_routing::Destination::NodeAddress { node, .. }
+            if node != node_id =>
+        {
+            continue_chain("the destination belongs to another node")
+        }
+        // A plain address with no hops left is a `via=[A]` chain: the Hub itself
+        // dials plain addresses, so it only sends one here to make this node the
+        // exit. The exit's own allowlist is the second gate section 9.3 requires,
+        // and it is the *same* gate a `NodeAddressTarget` naming this node passes,
+        // so being a chain's exit grants nothing a published forward could not
+        // already ask for.
+        wsnet_routing::Destination::Address { host, port } => {
+            if *port == 0 || !policy.permits_node_address(host) {
+                return Err(InboundRefusal::new(
+                    OpenStatus::Denied,
+                    format!("`{host}:{port}` is not in this node's allowlist"),
+                ));
+            }
+            Ok(InboundPlan::Dial(ResolvedTarget {
+                host: host.clone(),
+                port: *port,
+            }))
+        }
+        _ => resolve_inbound(node_id, services, policy, fields).map(InboundPlan::Dial),
     }
 }
 
@@ -330,11 +426,66 @@ pub(crate) async fn serve_inbound(
     }
 }
 
+/// The next leg a hop has to open (DESIGN.md section 7.1).
+///
+/// Kept as a value so the *decision* ([`plan_inbound`]) stays independent of the
+/// plumbing that carries it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainLeg {
+    /// Destination exactly as the Hub wrote it; a hop never rewrites it.
+    pub destination: wsnet_routing::Destination,
+    /// Hops still to run, in order, which is what the next leg's `Open` carries.
+    pub via: Vec<String>,
+    /// Protocol the leg carries.
+    pub proto: wsnet_routing::Proto,
+}
+
+/// Relays one chain leg in both directions (DESIGN.md sections 7.1, 7.2, 7.5).
+///
+/// A hop is a bridge, not a dialler: the next leg was already opened on the *same*
+/// session (section 7.1 makes a chain same-Hub by construction), and this task only
+/// moves bytes between the two halves. Both halves are [`SessionStream`]s, so
+/// credit, backpressure, and half-close are the code the local entry points already
+/// use instead of a second implementation that could silently disagree with it.
+///
+/// The answer to the leg's `Open` is produced here rather than before the bridge
+/// exists, because section 7.1 only permits a success once the far end can carry
+/// data: the next leg is `Ready` by the time this runs, which is what makes the
+/// caller's success mean the whole chain is up.
+pub(crate) async fn relay_leg(
+    handle: SessionHandle,
+    request_id: [u8; 16],
+    stream_id: u64,
+    mut inbound: SessionStream,
+    mut next: SessionStream,
+) {
+    let result = OpenResultFields {
+        request_id,
+        stream_id,
+        status: OpenStatus::Ok,
+        detail: "the chain leg is ready".to_string(),
+    };
+    // `send_open_result` sends `Ready` itself on success.
+    if handle.send_open_result(&result).is_err() {
+        return;
+    }
+    debug!(%stream_id, "relaying a chain leg");
+
+    // `copy_bidirectional` propagates end-of-stream as a half-close on the other
+    // side, which is section 7.2's rule; a reset on either half surfaces as an
+    // error here, and the leg is then reset rather than left half-open.
+    if let Err(error) = tokio::io::copy_bidirectional(&mut inbound, &mut next).await {
+        debug!(%error, %stream_id, "the chain leg ended with an error");
+        let _ = handle.send_reset(stream_id, ResetReason::Unreachable);
+    } else {
+        trace!(%stream_id, "the chain leg ended cleanly");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wsnet_routing::{Destination, Proto};
-
     fn registration(name: &str, target: &str) -> ServiceRegistration {
         ServiceRegistration {
             name: name.to_string(),
@@ -521,5 +672,124 @@ mod tests {
         assert_eq!(parse_target("no-port"), None);
         assert_eq!(parse_target(":80"), None);
         assert_eq!(parse_target("host:0"), None);
+    }
+
+    // ------------------------------------------------------------- section 7.1
+
+    fn open_with_via(destination: Destination, via: &[&str]) -> OpenFields {
+        OpenFields {
+            via: via.iter().map(|hop| (*hop).to_string()).collect(),
+            ..open(destination)
+        }
+    }
+
+    fn relaying() -> InboundPolicy {
+        InboundPolicy::deny_all().with_relay_forward(true)
+    }
+
+    /// A leg that still names hops belongs to an intermediate node, whatever the
+    /// destination says.
+    #[test]
+    fn a_leg_with_hops_left_is_forwarded_not_dialled() {
+        let plan = plan_inbound(
+            "hop1",
+            &[],
+            &relaying(),
+            &open_with_via(Destination::address("127.0.0.1", 80), &["hop2"]),
+        )
+        .expect("a consented hop must continue the chain");
+        assert_eq!(plan, InboundPlan::Forward);
+
+        // Without consent the same leg is refused, which is the local half of the
+        // section 9.3 gate for an intermediate node.
+        let refusal = plan_inbound(
+            "hop1",
+            &[],
+            &InboundPolicy::deny_all(),
+            &open_with_via(Destination::address("127.0.0.1", 80), &["hop2"]),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.status, OpenStatus::Denied);
+        assert!(refusal.detail.contains("does not relay"), "{}", refusal.detail);
+    }
+
+    /// A destination naming another node is someone else's exit, so this node is a
+    /// hop. A destination naming *this* node is not, and must still resolve
+    /// locally.
+    #[test]
+    fn a_destination_naming_another_node_is_forwarded() {
+        let plan = plan_inbound(
+            "hop1",
+            &[],
+            &relaying(),
+            &open(Destination::service("publisher", "web")),
+        )
+        .expect("a consented hop must continue the chain");
+        assert_eq!(plan, InboundPlan::Forward);
+
+        let refusal = plan_inbound(
+            "hop1",
+            &[],
+            &InboundPolicy::deny_all(),
+            &open(Destination::service("publisher", "web")),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.status, OpenStatus::Denied);
+
+        // Naming this node is the ordinary reverse-access case and never forwards,
+        // even with relaying enabled: a node must not bounce its own traffic.
+        let services = vec![registration("web", "127.0.0.1:8080")];
+        let plan = plan_inbound(
+            "publisher",
+            &services,
+            &relaying(),
+            &open(Destination::service("publisher", "web")),
+        )
+        .expect("a published service must resolve locally");
+        assert_eq!(
+            plan,
+            InboundPlan::Dial(ResolvedTarget {
+                host: "127.0.0.1".into(),
+                port: 8080
+            })
+        );
+    }
+
+    /// `via=[A]` sends A a plain address, and A's own allowlist is the gate.
+    #[test]
+    fn a_plain_address_exit_needs_this_nodes_allowlist() {
+        let destination = Destination::address("127.0.0.1", 9000);
+
+        let refusal = plan_inbound(
+            "hop",
+            &[],
+            &InboundPolicy::deny_all(),
+            &open(destination.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.status, OpenStatus::Denied);
+
+        let policy = InboundPolicy::deny_all()
+            .allow_node_address("127.0.0.1/32")
+            .unwrap();
+        let plan = plan_inbound("hop", &[], &policy, &open(destination))
+            .expect("an allowlisted address must be dialled");
+        assert_eq!(
+            plan,
+            InboundPlan::Dial(ResolvedTarget {
+                host: "127.0.0.1".into(),
+                port: 9000
+            })
+        );
+
+        // Port 0 is not a dialable address even inside the allowlist.
+        let refusal = plan_inbound(
+            "hop",
+            &[],
+            &policy,
+            &open(Destination::address("127.0.0.1", 0)),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.status, OpenStatus::Denied);
     }
 }

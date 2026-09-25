@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +36,7 @@ use wsnet_control::{
     ServicesReport, SessionState as ControlSessionState, StatusReport,
 };
 use wsnet_node::{Node, NodeOptions};
+use wsnet_routing::Proto;
 
 #[derive(Debug, Parser)]
 #[command(name = "wsnet", version, about = "wsnet node client and management CLI")]
@@ -172,7 +174,10 @@ async fn run(path: &Path, endpoint_override: Option<&str>) -> anyhow::Result<()>
     let services = config.services.clone();
     let node_id = config.client.node_id.clone();
 
-    let options = NodeOptions::default();
+    // DESIGN.md section 6.1 leaves the carrier family to the deployment, so the
+    // configured choice picks the transport before the node takes the document.
+    let carrier = config.client.carrier;
+    let options = NodeOptions::default().with_carrier(carrier);
     let node = Node::build(config, options).context("building the node")?;
 
     let endpoint = match endpoint_override {
@@ -421,29 +426,75 @@ impl Handler {
             .collect()
     }
 
-    /// The services this node publishes, as configured.
+    /// The service directory this node can honestly report.
     ///
-    /// The node crate's `ServiceDirectory` answers membership queries but cannot
-    /// enumerate a remote directory, so a remote listing is not faked here. What
-    /// this reports is exactly what the node registered in its `Hello`.
+    /// Two sources are merged, and they are not the same claim:
+    ///
+    /// * every Hub's `PeerList` (DESIGN.md section 8) — that Hub's own
+    ///   ACL-filtered statement that these services exist and are published by a
+    ///   node it holds a lease for, so they are `Ready`;
+    /// * this node's configured `[[services]]`, for a Hub whose snapshot does not
+    ///   mention them. A Hub that *has* spoken and omitted a local publication is
+    ///   reporting that the publication is not registered there, which is what
+    ///   `Offline` means; a Hub that has sent no snapshot at all cannot confirm or
+    ///   deny anything, so the local view stands rather than being reported as a
+    ///   failure the node cannot actually observe.
     fn services(&self) -> Vec<ServiceDescriptor> {
-        let hub = self
-            .node
-            .hub_ids()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| "local".to_string());
-        self.services
-            .iter()
-            .map(|service| ServiceDescriptor {
-                hub: hub.clone(),
-                node: self.node_id.clone(),
-                name: service.name.clone(),
-                proto: service.proto,
-                revision: 0,
-                state: ServiceState::Ready,
-            })
-            .collect()
+        let hub_ids = self.node.hub_ids();
+        let mut out: Vec<ServiceDescriptor> = Vec::new();
+        let mut advertised: BTreeSet<(String, String, String)> = BTreeSet::new();
+
+        for hub_id in &hub_ids {
+            let Some(directory) = self.node.directory(hub_id) else {
+                continue;
+            };
+            if !directory.is_known() {
+                continue;
+            }
+            for (node, name, entry) in directory.advertisements() {
+                advertised.insert((hub_id.clone(), node.to_string(), name.to_string()));
+                out.push(ServiceDescriptor {
+                    hub: hub_id.clone(),
+                    node: node.to_string(),
+                    name: name.to_string(),
+                    // The Hub reports these when it has them; otherwise the
+                    // protocol is unknown and TCP is the schema's default answer
+                    // rather than an invented UDP claim.
+                    proto: entry.proto.unwrap_or(Proto::Tcp),
+                    revision: entry.revision.unwrap_or(0),
+                    state: ServiceState::Ready,
+                });
+            }
+        }
+
+        for hub_id in &hub_ids {
+            let confirmed = self
+                .node
+                .directory(hub_id)
+                .is_some_and(|directory| directory.is_known());
+            for service in &self.services {
+                if advertised.contains(&(
+                    hub_id.clone(),
+                    self.node_id.clone(),
+                    service.name.clone(),
+                )) {
+                    continue;
+                }
+                out.push(ServiceDescriptor {
+                    hub: hub_id.clone(),
+                    node: self.node_id.clone(),
+                    name: service.name.clone(),
+                    proto: service.proto,
+                    revision: 0,
+                    state: if confirmed {
+                        ServiceState::Offline
+                    } else {
+                        ServiceState::Ready
+                    },
+                });
+            }
+        }
+        out
     }
 }
 

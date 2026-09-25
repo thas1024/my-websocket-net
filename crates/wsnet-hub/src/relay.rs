@@ -80,6 +80,9 @@ const DETAIL_STREAM_TAKEN: &str = "the stream id is already in use";
 /// Detail used when the bridge needs an async runtime that is not there.
 const DETAIL_NO_RUNTIME: &str = "bridging to a publishing node needs an async runtime";
 
+/// Detail used for a relay plan whose hop list turned out to be empty.
+const DETAIL_RELAY_EMPTY_CHAIN: &str = "the relay chain has no hops";
+
 /// Detail reported with a successful bridged `OpenResult`.
 const DETAIL_BRIDGED: &str = "bridged to the publishing node";
 
@@ -117,6 +120,55 @@ fn fresh_request_id() -> [u8; 16] {
 /// leg, so a Hub that cannot find that node's live session answers `Offline`
 /// rather than substituting a target of its own.
 pub(crate) fn spawn_relay(hub: &Hub, entry: &SharedSession, fields: &OpenFields, node_id: &str) {
+    spawn_relay_with_via(hub, entry, fields, node_id, Vec::new());
+}
+
+/// Spawns the task that bridges one authorised `Open` to the first hop of a chain.
+///
+/// Section 7.1 fixes the shape of a multi-hop path:
+///
+/// > `via=[A,B]` 路径为 client→H→A→H→B→target。v1 是同 Hub 星型回转链，不是任意
+/// > mesh
+///
+/// so a hop is not an exit: it is asked to hand the flow *back* to the Hub with the
+/// rest of the chain still to run. The leg opened here therefore carries the
+/// remaining chain in its own `via`, which is what a hop needs in order to forward
+/// rather than dial. Because the chain strictly shrinks at every hop, a loop is
+/// impossible by construction rather than by a hop counter, and `authorize_open`
+/// has already rejected a chain that repeats a node.
+pub(crate) fn spawn_relay_chain(
+    hub: &Hub,
+    entry: &SharedSession,
+    fields: &OpenFields,
+    hops: &[String],
+) {
+    let Some((first, rest)) = hops.split_first() else {
+        // `authorize_open` returns `Relay` only for a non-empty chain, so this is
+        // unreachable; answering rather than panicking keeps a Hub that got here
+        // through some future change diagnosable instead of aborting the process.
+        tracing::warn!(
+            session = %hex::encode(entry.session_id),
+            "a relay plan with no hops cannot be bridged"
+        );
+        hub.refuse_open(
+            entry,
+            fields,
+            OpenStatus::Refused,
+            DETAIL_RELAY_EMPTY_CHAIN,
+        );
+        return;
+    };
+    spawn_relay_with_via(hub, entry, fields, first, rest.to_vec());
+}
+
+/// Bridges one `Open` to `node_id`, telling that node which chain is left to run.
+fn spawn_relay_with_via(
+    hub: &Hub,
+    entry: &SharedSession,
+    fields: &OpenFields,
+    node_id: &str,
+    via: Vec<String>,
+) {
     let Some(publisher) = hub.session_for_node(node_id) else {
         hub.refuse_open(entry, fields, OpenStatus::Offline, DETAIL_PUBLISHER_OFFLINE);
         return;
@@ -148,7 +200,7 @@ pub(crate) fn spawn_relay(hub: &Hub, entry: &SharedSession, fields: &OpenFields,
         caller_request: fields.request_id,
         publisher,
         destination: fields.destination.clone(),
-        via: fields.via.clone(),
+        via,
         proto: fields.proto,
     };
     tracing::debug!(
@@ -156,6 +208,7 @@ pub(crate) fn spawn_relay(hub: &Hub, entry: &SharedSession, fields: &OpenFields,
         session = %hex::encode(entry.session_id),
         stream_id = fields.stream_id,
         publisher_node = %node_id,
+        hops_left = bridge.via.len(),
         "bridging a stream to the publishing node"
     );
     runtime.spawn(async move { bridge.run(events).await });
@@ -177,8 +230,11 @@ struct Bridge {
     publisher: SharedSession,
     /// The destination exactly as the caller wrote it, pinned revision included.
     destination: Destination,
-    /// The caller's `via` chain, which is empty for a plan that reaches this
-    /// module (a non-empty chain resolves to [`crate::ExitPlan::Relay`]).
+    /// The chain this leg still has to run, as written into the leg's own `Open`.
+    ///
+    /// Empty for a plan that reaches the publishing node or the raw-address exit;
+    /// non-empty when the leg goes to an intermediate hop, which is what tells that
+    /// hop to hand the flow back to the Hub instead of dialling it (section 7.1).
     via: Vec<String>,
     /// Protocol the `Open` named.
     proto: Proto,

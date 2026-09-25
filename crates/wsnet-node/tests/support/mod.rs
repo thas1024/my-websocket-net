@@ -378,6 +378,9 @@ async fn serve_connection(
 }
 
 /// The `PeerList` metadata shape this node reads (DESIGN.md section 4.1).
+///
+/// The revision is a decimal string because section 4.1 carries unsigned integers
+/// that way; a JSON number here would be silently unreadable as a version.
 fn peer_list(services: &[(String, String)]) -> Canonical {
     Canonical::object([
         (
@@ -395,7 +398,7 @@ fn peer_list(services: &[(String, String)]) -> Canonical {
                     .collect(),
             ),
         ),
-        ("version", Canonical::int(1)),
+        ("version", Canonical::u64_decimal(1)),
     ])
 }
 

@@ -18,7 +18,8 @@
 //!
 //! * [`HubTransport`] is everything the node needs from one Hub's plumbing. The
 //!   shipped [`HttpTransport`] speaks `POST /m` for authentication and uplink
-//!   plus `GET /e` SSE for downlink; a test can supply its own.
+//!   plus `GET /e` SSE for downlink, and [`WsTransport`] speaks the `GET /w`
+//!   WebSocket carrier of DESIGN.md section 6.1; a test can supply its own.
 //! * [`FlowOpener`] is what the local entry points call to obtain a remote
 //!   stream, so the SOCKS5 and Local Forward layers never touch a session
 //!   directly.
@@ -41,6 +42,7 @@ pub mod node;
 pub mod select;
 pub mod socks;
 pub mod stream;
+pub mod ws;
 
 pub use carrier::{CarrierIo, CarrierKind};
 pub use endpoint::{BoundSession, HubEndpoint, HubTransport, TransportFactory};
@@ -55,6 +57,7 @@ pub use node::{FlowOpener, Node, NodeError, NodeOptions, NodeRuntime};
 pub use select::{select_hub, Candidate, HubChoice, ServiceDirectory};
 pub use socks::{destination_for, SocksBridge};
 pub use stream::SessionStream;
+pub use ws::{factory_for, WsTransport, WsTransportFactory};
 
 /// A boxed, `Send`, borrowing future.
 ///

@@ -18,7 +18,10 @@
 
 use std::collections::BTreeMap;
 
-use wsnet_limits::{CONTROL_RESERVE_BYTES, REORDER_BUFFER_BYTES, STREAM_MAX_CREDIT};
+use wsnet_limits::{
+    CONTROL_RESERVE_BYTES, REORDER_BUFFER_BYTES, REORDER_MAX_BLOCKS, REORDER_MAX_OUT_OF_ORDER_BYTES,
+    STREAM_MAX_CREDIT,
+};
 
 /// Errors from the stream state machines.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -66,6 +69,32 @@ pub enum StreamError {
         /// Configured budget.
         limit: usize,
     },
+    /// The reorder buffer would hold more out-of-order blocks than §7.3 allows.
+    #[error("reorder buffer would hold {would_hold} blocks, limit is {limit}")]
+    TooManyBlocks {
+        /// Blocks the buffer would hold.
+        would_hold: usize,
+        /// Configured block budget.
+        limit: usize,
+    },
+    /// A block starts further ahead of the next expected offset than §7.3 allows.
+    ///
+    /// §7.3 bounds reorder *by offset* ("接收按 offset 有限重排"), not only by
+    /// bytes: without this, a peer could park a single tiny block at an arbitrary
+    /// distance and force the receiver to remember an unbounded hole.
+    #[error(
+        "offset {offset} is {ahead} bytes ahead of the next expected offset {next}, past the {limit} bound"
+    )]
+    TooFarAhead {
+        /// Offset the offending block starts at.
+        offset: u64,
+        /// The next expected offset.
+        next: u64,
+        /// How far ahead the block starts.
+        ahead: u64,
+        /// The configured look-ahead bound.
+        limit: u64,
+    },
     /// A block partially overlapped data that was already delivered, or
     /// overlapped a buffered block with different boundaries.
     #[error("block at offset {offset} length {length} conflicts with neighbouring data")]
@@ -78,28 +107,52 @@ pub enum StreamError {
 }
 
 /// Reassembles an ordered byte stream from possibly out-of-order blocks.
+///
+/// §7.3 fixes three budgets for the out-of-order part of one direction: at most
+/// [`REORDER_MAX_OUT_OF_ORDER_BYTES`] bytes, at most [`REORDER_MAX_BLOCKS`]
+/// blocks, and — inside the per-direction total of [`REORDER_BUFFER_BYTES`] — a
+/// bounded distance ahead of the next expected offset. All three are enforced
+/// here rather than left as documentation, because a peer can choose any of them
+/// adversarially.
 #[derive(Debug)]
 pub struct ReorderBuffer {
     next: u64,
     pending: BTreeMap<u64, Vec<u8>>,
     buffered: usize,
     limit_bytes: usize,
+    /// §7.3's block budget for the out-of-order part.
+    limit_blocks: usize,
+    /// §7.3's per-direction total, which also bounds how far ahead a block may
+    /// start: the credit window never lets the peer legitimately send past it.
+    look_ahead_bytes: u64,
 }
 
 impl ReorderBuffer {
     /// Creates a buffer that expects `start_offset` next.
     pub fn new(start_offset: u64) -> Self {
-        ReorderBuffer::with_limit(start_offset, REORDER_BUFFER_BYTES)
+        ReorderBuffer::with_limit(start_offset, REORDER_MAX_OUT_OF_ORDER_BYTES)
     }
 
     /// Creates a buffer with an explicit byte budget.
+    ///
+    /// The explicit budget is clamped to [`REORDER_BUFFER_BYTES`], §7.3's
+    /// per-direction total unconsumed budget: the out-of-order part is a subset of
+    /// the total, so a caller cannot raise it past the design's own ceiling.
     pub fn with_limit(start_offset: u64, limit_bytes: usize) -> Self {
         ReorderBuffer {
             next: start_offset,
             pending: BTreeMap::new(),
             buffered: 0,
-            limit_bytes,
+            limit_bytes: limit_bytes.min(REORDER_BUFFER_BYTES),
+            limit_blocks: REORDER_MAX_BLOCKS,
+            look_ahead_bytes: REORDER_BUFFER_BYTES as u64,
         }
+    }
+
+    /// Overrides §7.3's block budget, for tests that need a small buffer.
+    pub fn with_block_limit(mut self, limit_blocks: usize) -> Self {
+        self.limit_blocks = limit_blocks;
+        self
     }
 
     /// The next offset that will be delivered.
@@ -110,6 +163,21 @@ impl ReorderBuffer {
     /// Bytes currently held out of order.
     pub fn buffered(&self) -> usize {
         self.buffered
+    }
+
+    /// Blocks currently held out of order.
+    pub fn buffered_blocks(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The out-of-order byte budget in force.
+    pub fn byte_limit(&self) -> usize {
+        self.limit_bytes
+    }
+
+    /// The out-of-order block budget in force (§7.3).
+    pub fn block_limit(&self) -> usize {
+        self.limit_blocks
     }
 
     /// Bytes of control queue a saturated data buffer must leave free (§7.5).
@@ -163,6 +231,18 @@ impl ReorderBuffer {
                 length: data.len(),
             });
         }
+        // §7.3 bounds reorder by offset as well as by bytes: a block arbitrarily
+        // far ahead would force the receiver to remember an unbounded hole, and
+        // §7.5's credit window means the peer could never have sent it honestly.
+        let ahead = offset - self.next;
+        if ahead > self.look_ahead_bytes {
+            return Err(StreamError::TooFarAhead {
+                offset,
+                next: self.next,
+                ahead,
+                limit: self.look_ahead_bytes,
+            });
+        }
 
         // Any buffered block starting at or before this offset must not overlap.
         if let Some((&prev_offset, prev_data)) = self.pending.range(..=offset).next_back() {
@@ -195,12 +275,25 @@ impl ReorderBuffer {
             }
         }
 
+        // A block that starts at the next expected offset is delivered at once and
+        // never buffered, so the block budget applies only to the out-of-order
+        // part; checking it unconditionally would refuse a legal in-order block
+        // once the buffer happened to be full.
         let would_hold = self.buffered + data.len();
         if would_hold > self.limit_bytes {
             return Err(StreamError::ReorderOverflow {
                 would_hold,
                 limit: self.limit_bytes,
             });
+        }
+        if offset != self.next {
+            let blocks = self.pending.len() + 1;
+            if blocks > self.limit_blocks {
+                return Err(StreamError::TooManyBlocks {
+                    would_hold: blocks,
+                    limit: self.limit_blocks,
+                });
+            }
         }
 
         self.buffered += data.len();
@@ -481,6 +574,79 @@ mod tests {
             buffer.insert(u64::MAX, b"ab").unwrap_err(),
             StreamError::OffsetOverflow
         );
+    }
+
+    /// §7.3 fixes all three out-of-order budgets, so the defaults must be the
+    /// declared constants rather than the per-direction total.
+    #[test]
+    fn the_default_out_of_order_budgets_are_the_designs() {
+        let buffer = ReorderBuffer::new(0);
+        assert_eq!(buffer.byte_limit(), REORDER_MAX_OUT_OF_ORDER_BYTES);
+        assert_eq!(buffer.block_limit(), REORDER_MAX_BLOCKS);
+        assert!(
+            buffer.byte_limit() < REORDER_BUFFER_BYTES,
+            "the out-of-order part is a strict subset of the per-direction total"
+        );
+        // The explicit budget is clamped to the per-direction total, so a caller
+        // cannot raise the out-of-order budget past the design's ceiling.
+        assert_eq!(
+            ReorderBuffer::with_limit(0, REORDER_BUFFER_BYTES * 4).byte_limit(),
+            REORDER_BUFFER_BYTES
+        );
+    }
+
+    /// §7.3: reorder is bounded by offset, not only by bytes.
+    #[test]
+    fn a_block_far_ahead_of_the_expected_offset_is_refused() {
+        let mut buffer = ReorderBuffer::new(0);
+        assert_eq!(
+            buffer.insert(REORDER_BUFFER_BYTES as u64 + 1, b"tiny").unwrap_err(),
+            StreamError::TooFarAhead {
+                offset: REORDER_BUFFER_BYTES as u64 + 1,
+                next: 0,
+                ahead: REORDER_BUFFER_BYTES as u64 + 1,
+                limit: REORDER_BUFFER_BYTES as u64,
+            }
+        );
+        // Exactly at the bound is still accepted, because a peer that respects its
+        // credit window can legitimately be that far ahead.
+        assert!(buffer
+            .insert(REORDER_BUFFER_BYTES as u64, b"tiny")
+            .is_ok());
+    }
+
+    /// The block budget counts buffered blocks, not delivered ones: closing a hole
+    /// must never be refused because the buffer happens to be full.
+    #[test]
+    fn the_block_budget_never_refuses_an_in_order_block() {
+        let mut buffer = ReorderBuffer::new(0).with_block_limit(2);
+        assert!(buffer.insert(1, b"b").unwrap().is_empty());
+        assert!(buffer.insert(3, b"d").unwrap().is_empty());
+        assert_eq!(buffer.buffered_blocks(), 2, "the budget is exactly full");
+        assert_eq!(
+            buffer.insert(0, b"a").unwrap(),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+        assert_eq!(buffer.next_offset(), 2);
+        assert_eq!(buffer.buffered_blocks(), 1);
+        assert_eq!(
+            buffer.insert(2, b"c").unwrap(),
+            vec![b"c".to_vec(), b"d".to_vec()]
+        );
+        assert_eq!(buffer.buffered_blocks(), 0);
+
+        // The block past the budget is refused, and leaves no trace.
+        let mut buffer = ReorderBuffer::new(0).with_block_limit(1);
+        assert!(buffer.insert(1, b"b").unwrap().is_empty());
+        assert_eq!(
+            buffer.insert(3, b"d").unwrap_err(),
+            StreamError::TooManyBlocks {
+                would_hold: 2,
+                limit: 1
+            }
+        );
+        assert_eq!(buffer.buffered_blocks(), 1);
+        assert_eq!(buffer.buffered(), 1);
     }
 
     // ------------------------------------------------------------------ credit

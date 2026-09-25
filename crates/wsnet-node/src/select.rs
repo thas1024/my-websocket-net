@@ -7,10 +7,10 @@
 //! and service directory, so the policy is testable without any I/O and the node
 //! only has to gather the snapshot.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use wsnet_protocol::Canonical;
-use wsnet_routing::Destination;
+use wsnet_routing::{Destination, Proto};
 
 /// Which Hub a flow must use.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -31,7 +31,27 @@ pub enum HubChoice {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServiceDirectory {
     known: bool,
-    services: BTreeSet<(String, String)>,
+    services: BTreeMap<(String, String), Advertisement>,
+    /// Revision of the snapshot currently applied.
+    ///
+    /// Section 4.1 makes `PeerList` a *versioned* snapshot and section 8 says a
+    /// receiver ignores a revision older than one it has already applied, so the
+    /// applied revision is kept here rather than being left to the caller: a
+    /// retransmitted old snapshot must not silently resurrect a withdrawn service.
+    revision: Option<u64>,
+}
+
+/// What a `PeerList` entry said about a service beyond its identity.
+///
+/// Both fields are optional because the snapshot is a routing hint: a Hub that
+/// omits them still advertises the service, and dropping the entry would turn a
+/// usable hint into a false negative.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Advertisement {
+    /// Protocol the publisher registered.
+    pub proto: Option<Proto>,
+    /// Per-service revision at the time of the snapshot.
+    pub revision: Option<u64>,
 }
 
 impl ServiceDirectory {
@@ -44,13 +64,15 @@ impl ServiceDirectory {
     pub fn known_empty() -> Self {
         ServiceDirectory {
             known: true,
-            services: BTreeSet::new(),
+            services: BTreeMap::new(),
+            revision: None,
         }
     }
 
     /// Reads a `PeerList` snapshot.
     ///
-    /// The shape this node expects is `{"services":[{"node":..,"name":..},..]}`.
+    /// The shape this node expects is
+    /// `{"hub":..,"services":[{"node":..,"name":..},..],"version":..}`.
     /// Malformed entries are ignored rather than failing the whole snapshot: a
     /// directory is a routing hint, and a Hub that sends a partly unreadable one
     /// must not make the node unusable. A syntactically valid `PeerList` still
@@ -58,24 +80,60 @@ impl ServiceDirectory {
     pub fn from_peer_list(value: &Canonical) -> Self {
         let mut directory = ServiceDirectory {
             known: true,
-            services: BTreeSet::new(),
+            services: BTreeMap::new(),
+            revision: value.get_u64("version").ok(),
         };
         if let Ok(entries) = value.get_array("services") {
             for entry in entries {
                 let (Ok(node), Ok(name)) = (entry.get_str("node"), entry.get_str("name")) else {
                     continue;
                 };
-                directory
-                    .services
-                    .insert((node.to_string(), name.to_string()));
+                let proto = entry
+                    .get_str("proto")
+                    .ok()
+                    .and_then(|text| match text {
+                        "tcp" => Some(Proto::Tcp),
+                        "udp" => Some(Proto::Udp),
+                        _ => None,
+                    });
+                let revision = entry.get_u64("revision").ok();
+                directory.services.insert(
+                    (node.to_string(), name.to_string()),
+                    Advertisement { proto, revision },
+                );
             }
         }
         directory
     }
 
+    /// Applies a `PeerList` snapshot, ignoring one that is not newer.
+    ///
+    /// Returns whether the snapshot was applied. A snapshot whose revision is not
+    /// greater than the applied one is dropped, which is what section 8's
+    /// "ignores a revision older than one it has already applied" requires; an
+    /// unversioned snapshot is treated as older for the same reason, because
+    /// accepting it could undo a newer one.
+    pub fn apply_peer_list(&mut self, value: &Canonical) -> bool {
+        let incoming = Self::from_peer_list(value);
+        if let (Some(applied), Some(incoming_revision)) = (self.revision, incoming.revision) {
+            if incoming_revision <= applied {
+                return false;
+            }
+        } else if self.known && incoming.revision.is_none() {
+            return false;
+        }
+        *self = incoming;
+        true
+    }
+
     /// Whether a `PeerList` has been received for this Hub.
     pub fn is_known(&self) -> bool {
         self.known
+    }
+
+    /// The revision of the applied snapshot, when it carried one.
+    pub fn revision(&self) -> Option<u64> {
+        self.revision
     }
 
     /// Number of advertised services.
@@ -88,10 +146,29 @@ impl ServiceDirectory {
         self.services.is_empty()
     }
 
+    /// Every advertised `(node, service)` pair, in the directory's own order.
+    ///
+    /// This is what makes `wsnet services list` able to report what the Hub
+    /// advertises instead of only what this node publishes itself. It is
+    /// deliberately not a `&ServiceDirectory`-wide dump: the set is already
+    /// filtered by the Hub's ACL for this caller.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.services
+            .keys()
+            .map(|(node, name)| (node.as_str(), name.as_str()))
+    }
+
+    /// Every advertisement, including the protocol and revision the Hub reported.
+    pub fn advertisements(&self) -> impl Iterator<Item = (&str, &str, Advertisement)> {
+        self.services
+            .iter()
+            .map(|((node, name), entry)| (node.as_str(), name.as_str(), *entry))
+    }
+
     /// Whether `node` publishes `name` on this Hub.
     pub fn contains(&self, node: &str, name: &str) -> bool {
         self.services
-            .contains(&(node.to_string(), name.to_string()))
+            .contains_key(&(node.to_string(), name.to_string()))
     }
 }
 
@@ -164,11 +241,19 @@ mod tests {
     fn with_service(node: &str, name: &str) -> ServiceDirectory {
         ServiceDirectory {
             known: true,
-            services: BTreeSet::from([(node.to_string(), name.to_string())]),
+            services: BTreeMap::from([(
+                (node.to_string(), name.to_string()),
+                Advertisement::default(),
+            )]),
+            revision: None,
         }
     }
 
     fn peer_list(entries: &[(&str, &str)]) -> Canonical {
+        peer_list_versioned(entries, 1)
+    }
+
+    fn peer_list_versioned(entries: &[(&str, &str)], version: u64) -> Canonical {
         Canonical::object([
             (
                 "services",
@@ -184,7 +269,8 @@ mod tests {
                         .collect(),
                 ),
             ),
-            ("version", Canonical::int(1)),
+            // Section 4.1: an unsigned revision travels as a decimal string.
+            ("version", Canonical::u64_decimal(version)),
         ])
     }
 
@@ -263,5 +349,83 @@ mod tests {
         )]));
         assert!(malformed.is_known());
         assert!(malformed.is_empty());
+    }
+
+    /// `services list` needs the whole advertised set, not just membership.
+    #[test]
+    fn entries_enumerate_every_advertised_service() {
+        let directory =
+            ServiceDirectory::from_peer_list(&peer_list(&[("client-b", "web"), ("client-a", "db")]));
+        let listed: Vec<(&str, &str)> = directory.entries().collect();
+        assert_eq!(listed, vec![("client-a", "db"), ("client-b", "web")]);
+        assert_eq!(directory.revision(), Some(1));
+        assert!(ServiceDirectory::unknown().entries().next().is_none());
+    }
+
+    /// A richer snapshot keeps the protocol and revision it carried, and a
+    /// minimal one still advertises the service.
+    #[test]
+    fn advertisements_carry_the_reported_protocol() {
+        let rich = Canonical::object([
+            (
+                "services",
+                Canonical::Array(vec![Canonical::object([
+                    ("name", Canonical::str("dns")),
+                    ("node", Canonical::str("client-a")),
+                    ("proto", Canonical::str("udp")),
+                    ("revision", Canonical::u64_decimal(9)),
+                ])]),
+            ),
+            ("version", Canonical::u64_decimal(2)),
+        ]);
+        let directory = ServiceDirectory::from_peer_list(&rich);
+        let entries: Vec<_> = directory.advertisements().collect();
+        assert_eq!(
+            entries,
+            vec![(
+                "client-a",
+                "dns",
+                Advertisement {
+                    proto: Some(Proto::Udp),
+                    revision: Some(9)
+                }
+            )]
+        );
+        assert!(directory.contains("client-a", "dns"));
+
+        let minimal = ServiceDirectory::from_peer_list(&peer_list(&[("client-a", "web")]));
+        let entry = minimal.advertisements().next().unwrap().2;
+        assert_eq!(entry, Advertisement::default());
+    }
+
+    /// Section 8: a receiver ignores a revision it has already passed.
+    #[test]
+    fn an_older_peer_list_is_ignored() {
+        let mut directory = ServiceDirectory::unknown();
+        assert!(directory.apply_peer_list(&peer_list_versioned(&[("client-a", "web")], 4)));
+        assert_eq!(directory.revision(), Some(4));
+
+        // The same revision is not newer, so a withdrawal cannot be undone by a
+        // retransmission of the snapshot that predates it.
+        assert!(!directory.apply_peer_list(&peer_list_versioned(&[("client-a", "web")], 4)));
+        assert!(!directory.apply_peer_list(&peer_list_versioned(&[("client-a", "db")], 3)));
+        assert!(directory.contains("client-a", "web"));
+
+        // A newer revision replaces the whole snapshot, including a removal.
+        assert!(directory.apply_peer_list(&peer_list_versioned(&[("client-a", "db")], 5)));
+        assert_eq!(directory.revision(), Some(5));
+        assert!(!directory.contains("client-a", "web"));
+        assert!(directory.contains("client-a", "db"));
+
+        // An unversioned snapshot is treated as older than a versioned one.
+        let unversioned = Canonical::object([(
+            "services",
+            Canonical::Array(vec![Canonical::object([
+                ("name", Canonical::str("web")),
+                ("node", Canonical::str("client-a")),
+            ])]),
+        )]);
+        assert!(!directory.apply_peer_list(&unversioned));
+        assert!(directory.contains("client-a", "db"));
     }
 }
