@@ -332,14 +332,23 @@ async fn run_socket(
     // together: a single `WebSocket` cannot be borrowed mutably twice.
     let (mut sender, mut receiver) = socket.split();
 
-    let entry = match bound {
-        Some(entry) => entry,
+    let (entry, generation) = match bound {
+        Some(entry) => {
+            // A bound upgrade — the session's carrier after `bind`, or a liveness
+            // probe presenting the same `BindProof` — never owns the session. Only
+            // the socket that *authenticated* it does, which is what lets a probe
+            // come and go without tearing down the session it was checking, and
+            // what matches section 6.2's model of several carriers on one session.
+            (entry, None)
+        }
         None => match bootstrap_auth(&hub, &mut sender, &mut receiver, peer).await {
             Some(entry) => {
                 // The connection is no longer unauthenticated, so it stops
-                // consuming section 9.2's unauthenticated budget.
+                // consuming section 9.2's unauthenticated budget. This socket
+                // created the session, so its end is what releases it.
                 drop(guard);
-                entry
+                let generation = entry.claim_ws_owner();
+                (entry, Some(generation))
             }
             None => {
                 close_with_site(&hub, &mut sender).await;
@@ -385,7 +394,11 @@ async fn run_socket(
 
     // Section 5.3: the local side reclaims its resources, and section 5.5's
     // session/epoch guard makes sure a late teardown cannot delete a newer lease.
-    hub.close_session(&entry.session_id, &entry.epoch, "websocket closed");
+    // Only the socket that owns the carrier may end the session: a replaced carrier
+    // or a liveness probe ending is not the session ending.
+    if generation.is_some_and(|generation| entry.owns_ws(generation)) {
+        hub.close_session(&entry.session_id, &entry.epoch, "websocket closed");
+    }
 }
 
 /// The pre-authentication phase: one `Auth` Text frame inside the deadline.

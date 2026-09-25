@@ -38,14 +38,18 @@ use crate::BoxFuture;
 
 /// Builds the HTTP carrier set for every Hub.
 pub struct HttpTransportFactory {
-    client: Client,
+    /// Additional trusted roots, kept as the certificates themselves rather than as
+    /// a finished client: `ClientBuilder::build` consumes the builder, so the roots
+    /// have to be collected before the client is made. One client is built per
+    /// session, which is the only place the settings are needed.
+    roots: Vec<reqwest::Certificate>,
     request_timeout: Duration,
 }
 
 impl Default for HttpTransportFactory {
     fn default() -> Self {
         HttpTransportFactory {
-            client: Client::new(),
+            roots: Vec::new(),
             request_timeout: Duration::from_millis(HANDSHAKE_TIMEOUT_MS),
         }
     }
@@ -62,6 +66,36 @@ impl HttpTransportFactory {
         self.request_timeout = timeout;
         self
     }
+
+    /// Trusts one additional root certificate, in PEM form.
+    ///
+    /// DESIGN.md section 11 keeps the outer TLS in front of the deployment and
+    /// requires it to retain certificate verification and forward secrecy, so a
+    /// deployment that terminates with its own CA — the common shape behind a
+    /// private nginx — cannot be reached while the node trusts only the public
+    /// roots. This widens the set of trusted *roots* and nothing else: the hostname
+    /// is still verified, and verification is never turned off.
+    pub fn with_root_certificate(mut self, pem: &[u8]) -> Result<Self, NodeError> {
+        let certificate = reqwest::Certificate::from_pem(pem)
+            .map_err(|error| NodeError::Transport(format!("unusable root certificate: {error}")))?;
+        self.roots.push(certificate);
+        Ok(self)
+    }
+
+    /// Builds the client these settings describe.
+    ///
+    /// A client that cannot be built is reported rather than replaced by an
+    /// unconfigured one: silently dropping the operator's roots would be a
+    /// downgrade.
+    fn client(&self) -> Result<Client, NodeError> {
+        let mut builder = Client::builder();
+        for root in &self.roots {
+            builder = builder.add_root_certificate(root.clone());
+        }
+        builder
+            .build()
+            .map_err(|error| NodeError::Transport(format!("cannot build the http client: {error}")))
+    }
 }
 
 impl TransportFactory for HttpTransportFactory {
@@ -69,12 +103,17 @@ impl TransportFactory for HttpTransportFactory {
         &self,
         endpoint: &HubEndpoint,
     ) -> BoxFuture<'static, Result<Arc<dyn HubTransport>, NodeError>> {
-        let transport = HttpTransport {
-            client: self.client.clone(),
-            base: endpoint.url.trim_end_matches('/').to_string(),
-            request_timeout: self.request_timeout,
-        };
-        Box::pin(async move { Ok(Arc::new(transport) as Arc<dyn HubTransport>) })
+        let client = self.client();
+        let base = endpoint.url.trim_end_matches('/').to_string();
+        let request_timeout = self.request_timeout;
+        Box::pin(async move {
+            let transport = HttpTransport {
+                client: client?,
+                base,
+                request_timeout,
+            };
+            Ok(Arc::new(transport) as Arc<dyn HubTransport>)
+        })
     }
 }
 

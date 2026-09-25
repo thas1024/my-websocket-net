@@ -29,6 +29,22 @@ use wsnet_forward::{
 };
 use wsnet_routing::{Destination, Proto};
 
+/// Deadline for one loopback exchange in these tests.
+///
+/// These are *hang detectors*, not latency assertions: every behavioural claim is
+/// made by the bytes and the dial counts, so a generous deadline only distinguishes
+/// "wrong" from "stuck". A short one instead made the suite flaky whenever the
+/// machine was loaded, because a loopback `connect` that the kernel completes
+/// immediately can still wait behind a starved scheduler.
+const CONNECT_DEADLINE_SECS: u64 = 15;
+
+/// How long to let a freshly spawned accept loop reach its first `poll`.
+///
+/// The listener is already bound when the manager returns (so a client is never
+/// refused), but the task that accepts must be scheduled before a connection is
+/// observed. Left generous for the same reason as the deadline above.
+const SETTLE: Duration = Duration::from_millis(200);
+
 /// How a stub opener should behave.
 #[derive(Clone)]
 enum Mode {
@@ -129,7 +145,7 @@ async fn running_manager(
     let runner = Arc::clone(&manager);
     tokio::spawn(async move { runner.run(rx).await });
     // Give the accept loop a moment to start before a client connects.
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::time::sleep(SETTLE).await;
     (manager, tx, addr)
 }
 
@@ -149,14 +165,14 @@ async fn port_zero_reports_a_usable_address() {
     let (_manager, _tx, addr) = running_manager(service_spec("a-web"), Arc::clone(&opener)).await;
 
     assert_ne!(addr.port(), 0, "the OS-assigned port must be reported");
-    let mut client = timeout(Duration::from_secs(2), TcpStream::connect(addr))
+    let mut client = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), TcpStream::connect(addr))
         .await
         .expect("connect timed out")
         .expect("connect failed");
 
     client.write_all(b"ping").await.unwrap();
     let mut echoed = [0u8; 4];
-    timeout(Duration::from_secs(2), client.read_exact(&mut echoed))
+    timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), client.read_exact(&mut echoed))
         .await
         .expect("read timed out")
         .expect("read failed");
@@ -178,7 +194,7 @@ async fn the_opener_receives_the_configured_destination() {
     .with_via(vec!["client-b".into()]);
 
     let (_manager, _tx, addr) = running_manager(spec, Arc::clone(&opener)).await;
-    let _client = timeout(Duration::from_secs(2), TcpStream::connect(addr))
+    let _client = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), TcpStream::connect(addr))
         .await
         .unwrap()
         .unwrap();
@@ -201,7 +217,7 @@ async fn nothing_is_forwarded_before_the_open_resolves() {
     let opener = StubOpener::new(Mode::ServeAfter(Duration::from_millis(400)));
     let (_manager, _tx, addr) = running_manager(service_spec("slow"), Arc::clone(&opener)).await;
 
-    let mut client = timeout(Duration::from_secs(2), TcpStream::connect(addr))
+    let mut client = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), TcpStream::connect(addr))
         .await
         .unwrap()
         .unwrap();
@@ -216,7 +232,7 @@ async fn nothing_is_forwarded_before_the_open_resolves() {
     );
 
     // Once it resolves, the same bytes traverse the forward.
-    let n = timeout(Duration::from_secs(2), client.read(&mut buffer))
+    let n = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), client.read(&mut buffer))
         .await
         .expect("read timed out after the open resolved")
         .expect("read failed");
@@ -230,13 +246,13 @@ async fn a_failed_open_closes_the_local_connection() {
     let opener = StubOpener::new(Mode::Fail);
     let (manager, _tx, addr) = running_manager(service_spec("failing"), Arc::clone(&opener)).await;
 
-    let mut client = timeout(Duration::from_secs(2), TcpStream::connect(addr))
+    let mut client = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), TcpStream::connect(addr))
         .await
         .unwrap()
         .unwrap();
 
     let mut buffer = [0u8; 16];
-    let read = timeout(Duration::from_secs(2), client.read(&mut buffer))
+    let read = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), client.read(&mut buffer))
         .await
         .expect("read timed out")
         .expect("read failed");
@@ -332,16 +348,16 @@ async fn a_peer_outside_the_allowlist_never_reaches_the_opener() {
     let (tx, rx) = watch::channel(false);
     let runner = Arc::clone(&manager);
     tokio::spawn(async move { runner.run(rx).await });
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::time::sleep(SETTLE).await;
 
     // The listener is bound to 0.0.0.0, so connect through loopback.
     let dial = SocketAddr::from(([127, 0, 0, 1], addr.port()));
-    let mut client = timeout(Duration::from_secs(2), TcpStream::connect(dial))
+    let mut client = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), TcpStream::connect(dial))
         .await
         .expect("connect timed out")
         .expect("connect failed");
     let mut buffer = [0u8; 4];
-    let read = timeout(Duration::from_secs(2), client.read(&mut buffer))
+    let read = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), client.read(&mut buffer))
         .await
         .expect("read timed out")
         .expect("read failed");
@@ -367,12 +383,12 @@ async fn offline_and_denied_fast_fail_without_dialling() {
             running_manager(service_spec(label), Arc::clone(&opener)).await;
         manager.set_state(label, state).unwrap();
 
-        let mut client = timeout(Duration::from_secs(2), TcpStream::connect(addr))
+        let mut client = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), TcpStream::connect(addr))
             .await
             .unwrap()
             .unwrap();
         let mut buffer = [0u8; 4];
-        let read = timeout(Duration::from_secs(2), client.read(&mut buffer))
+        let read = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), client.read(&mut buffer))
             .await
             .expect("read timed out")
             .expect("read failed");
@@ -390,7 +406,7 @@ async fn recovery_applies_to_new_connections_only() {
     let (manager, _tx, addr) = running_manager(service_spec("recover"), Arc::clone(&opener)).await;
 
     manager.set_state("recover", ForwardState::Offline).unwrap();
-    let mut refused = timeout(Duration::from_secs(2), TcpStream::connect(addr))
+    let mut refused = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), TcpStream::connect(addr))
         .await
         .unwrap()
         .unwrap();
@@ -399,13 +415,13 @@ async fn recovery_applies_to_new_connections_only() {
     assert_eq!(opener.calls(), 0);
 
     manager.set_state("recover", ForwardState::Ready).unwrap();
-    let mut client = timeout(Duration::from_secs(2), TcpStream::connect(addr))
+    let mut client = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), TcpStream::connect(addr))
         .await
         .unwrap()
         .unwrap();
     client.write_all(b"hi").await.unwrap();
     let mut echoed = [0u8; 2];
-    timeout(Duration::from_secs(2), client.read_exact(&mut echoed))
+    timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), client.read_exact(&mut echoed))
         .await
         .expect("read timed out")
         .expect("read failed");
@@ -425,7 +441,7 @@ async fn remove_stops_accepting_and_frees_the_name() {
 
     // A connect to the old address is either refused outright or accepted and
     // immediately closed; either way the opener must not run.
-    if let Ok(Ok(mut client)) = timeout(Duration::from_secs(2), TcpStream::connect(addr)).await {
+    if let Ok(Ok(mut client)) = timeout(Duration::from_secs(CONNECT_DEADLINE_SECS), TcpStream::connect(addr)).await {
         let mut buffer = [0u8; 4];
         let _ = timeout(Duration::from_millis(300), client.read(&mut buffer)).await;
     }

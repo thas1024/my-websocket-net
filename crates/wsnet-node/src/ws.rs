@@ -309,35 +309,55 @@ impl HubTransport for WsTransport {
         let request = self.bound_request(&session);
         let timeout = self.request_timeout;
         Box::pin(async move {
+            // Section 5.5 wants an *authenticated* exchange, and a fresh bound
+            // upgrade is exactly that: the Hub verifies a `BindProof` covering this
+            // session, so a success proves the Hub still holds the session and that
+            // the binding key still works. It is non-destructive because only the
+            // socket that authenticated the session owns it
+            // (crates/wsnet-hub/src/server.rs), so the probe can come and go.
+            let probe_error = match request {
+                Ok(request) => match upgrade_probe(request, timeout).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => Some(error),
+                },
+                Err(error) => Some(error),
+            };
+
+            // The probe can fail for a reason that has nothing to do with this
+            // session — a Hub that is briefly out of descriptors refuses the new
+            // socket while serving the existing one perfectly well. Failing the
+            // session over that would drop a working carrier, so the live carrier
+            // gets the last word: a control-frame round trip on the socket the data
+            // actually uses. It is the weaker question, which is why it is only
+            // asked after the authenticated one has already failed.
             if let Some(probe) = live {
-                // The bound socket is the carrier the session actually uses, so a
-                // control-frame round trip on it is the strongest cheap answer to
-                // section 5.5's question: the Hub still answers this session, and
-                // the answer travelled the same path as its data.
                 let payload = fresh_channel_id().to_vec();
                 let (reply_tx, reply_rx) = oneshot::channel();
-                let sent = probe.send(Probe {
-                    payload,
-                    reply: reply_tx,
-                });
-                if sent.is_ok() {
-                    return match tokio::time::timeout(timeout, reply_rx).await {
-                        Ok(Ok(result)) => result,
-                        Ok(Err(_)) => Err(NodeError::Transport(
-                            "the bound websocket ended during the health check".to_string(),
-                        )),
-                        Err(_) => Err(NodeError::Transport(
-                            "the hub did not answer a ping on the bound websocket".to_string(),
-                        )),
-                    };
+                if probe
+                    .send(Probe {
+                        payload,
+                        reply: reply_tx,
+                    })
+                    .is_ok()
+                {
+                    match tokio::time::timeout(timeout, reply_rx).await {
+                        Ok(Ok(result)) => return result,
+                        Ok(Err(_)) => {
+                            return Err(NodeError::Transport(
+                                "the bound websocket ended during the health check".to_string(),
+                            ))
+                        }
+                        Err(_) => {
+                            return Err(NodeError::Transport(
+                                "the hub did not answer a ping on the bound websocket".to_string(),
+                            ))
+                        }
+                    }
                 }
             }
-            // Without a live carrier this falls back to a *fresh* bound upgrade,
-            // which is the only way to ask the Hub about the session. Note what the
-            // Hub does with it: ending a bound `GET /w` ends the session
-            // (crates/wsnet-hub/src/server.rs), so this path is reached only when
-            // the carrier is already gone and the session is therefore over.
-            upgrade_probe(request?, timeout).await
+            Err(probe_error.unwrap_or_else(|| {
+                NodeError::Transport("the websocket health check could not run".to_string())
+            }))
         })
     }
 }

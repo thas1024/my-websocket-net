@@ -94,9 +94,24 @@ reqwest = { version = "0.12", default-features = false, features = [
     "http2",
 ] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-rustls = "0.23"
-tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
 webpki-roots = "0.26"
+# Test-only: generates the self-signed certificate a TLS-terminating front end
+# needs, so the outer-TLS deployment shape is exercised without needing nginx. Its
+# default crypto backend is `aws-lc-rs`, which would add a cmake/C toolchain
+# requirement to an otherwise pure-Rust build, so the provider this workspace
+# already uses is selected explicitly.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

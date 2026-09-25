@@ -51,7 +51,8 @@ pub use health::HealthTracker;
 pub use http::{HttpTransport, HttpTransportFactory};
 pub use hub::HubSession;
 pub use inbound::{
-    resolve_inbound, InboundPolicy, InboundRefusal, ResolvedTarget,
+    plan_inbound, resolve_inbound, ChainLeg, InboundPlan, InboundPolicy, InboundRefusal,
+    ResolvedTarget,
 };
 pub use node::{FlowOpener, Node, NodeError, NodeOptions, NodeRuntime};
 pub use select::{select_hub, Candidate, HubChoice, ServiceDirectory};

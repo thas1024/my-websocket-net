@@ -39,4 +39,10 @@ wsnet-hub.workspace = true
 # Test binaries install no subscriber by default, which makes a hung acceptance
 # test produce no output at all; this is what makes `RUST_LOG` work here.
 tracing-subscriber.workspace = true
+# The TLS-front acceptance test terminates TLS itself (nginx is not available in
+# this environment) and must generate the certificate it serves, so that outer TLS
+# is exercised against a real chain rather than asserted about.
+rcgen.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
 

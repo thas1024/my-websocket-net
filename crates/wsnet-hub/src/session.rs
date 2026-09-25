@@ -68,6 +68,17 @@ struct Pump {
     next_sse_generation: u64,
     /// The generation that currently owns the single SSE subscription (4.4).
     sse_owner: Option<u64>,
+    /// Generation counter for WebSocket ownership.
+    next_ws_generation: u64,
+    /// The generation that currently owns the session's WebSocket carrier.
+    ///
+    /// Section 4.4 gives a session one SSE subscription, and section 6.2's model is
+    /// that several carriers may be active at once and any of them may carry the
+    /// next downlink record. A bound `GET /w` is therefore *not* necessarily the
+    /// session's only socket: a liveness probe presents the same `BindProof` and
+    /// must be able to come and go without ending the session it is checking. Only
+    /// the owner's end closes the session, exactly as the SSE owner's does.
+    ws_owner: Option<u64>,
 }
 
 impl SessionEntry {
@@ -98,6 +109,8 @@ impl SessionEntry {
                 streams: HashMap::new(),
                 next_sse_generation: 0,
                 sse_owner: None,
+                next_ws_generation: 0,
+                ws_owner: None,
             }),
         }
     }
@@ -127,6 +140,27 @@ impl SessionEntry {
     pub(crate) fn owns_sse(&self, generation: u64) -> bool {
         let pump = self.pump.lock().expect("pump mutex");
         pump.sse_owner == Some(generation)
+    }
+
+    /// Takes ownership of the session's WebSocket carrier.
+    ///
+    /// A bound `GET /w` becomes the owner, and every later bound upgrade replaces
+    /// it. Ownership is what decides whether the socket's end tears the session
+    /// down: a liveness probe or a replacement carrier must be able to end without
+    /// taking the session with it, which is the same rule section 4.4 applies to
+    /// the SSE subscription.
+    pub(crate) fn claim_ws_owner(&self) -> u64 {
+        let mut pump = self.pump.lock().expect("pump mutex");
+        pump.next_ws_generation = pump.next_ws_generation.wrapping_add(1);
+        let generation = pump.next_ws_generation;
+        pump.ws_owner = Some(generation);
+        generation
+    }
+
+    /// Whether `generation` still owns the WebSocket carrier.
+    pub(crate) fn owns_ws(&self, generation: u64) -> bool {
+        let pump = self.pump.lock().expect("pump mutex");
+        pump.ws_owner == Some(generation)
     }
 
     /// Claims one stream id for a stream task, and reports whether it was free.
