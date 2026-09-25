@@ -376,6 +376,14 @@ impl NodeRuntime {
                         if let Err(error) = session.health_check().await {
                             debug!(hub = %hub_id, %error, "hub health check failed");
                         }
+                        // Section 5.5 switches after three consecutive failed
+                        // checks, which is what the tracker counts. Waiting for
+                        // `Closed` alone would leave a Hub that accepts nothing
+                        // sitting in selection indefinitely.
+                        if !session.health().is_healthy() {
+                            warn!(hub = %hub_id, "hub is unhealthy; reconnecting");
+                            break;
+                        }
                     }
                 }
 
