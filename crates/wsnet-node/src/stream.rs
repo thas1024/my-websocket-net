@@ -46,6 +46,30 @@ pub(crate) enum StreamMsg {
     Reset(ResetReason),
 }
 
+/// The sending half of one UDP route (section 7.4).
+///
+/// It holds the session handle and the route's id, so it can be moved into the task
+/// that owns a route while the receiving half stays borrowed in the same `select!`.
+#[derive(Clone)]
+pub struct DatagramSender {
+    handle: SessionHandle,
+    stream_id: u64,
+}
+
+impl DatagramSender {
+    /// The route this sender writes to.
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// Sends one datagram, with the same contract as
+    /// [`SessionStream::send_datagram`].
+    pub fn send(&self, fields: DatagramFields, payload: &[u8]) -> Result<(), SessionError> {
+        self.handle
+            .send_datagram(fields.to_canonical(), payload.to_vec())
+    }
+}
+
 /// One TCP-like stream carried by a hub session.
 pub struct SessionStream {
     handle: SessionHandle,
@@ -122,6 +146,19 @@ impl SessionStream {
     ) -> Result<(), SessionError> {
         self.handle
             .send_datagram(fields.to_canonical(), payload.to_vec())
+    }
+
+    /// The sending half of this route, as a value that borrows nothing.
+    ///
+    /// A route handler has to send outgoing datagrams and wait for incoming ones at
+    /// the same time, and one `&mut SessionStream` cannot appear in both halves of a
+    /// `select!`. Splitting the sender out is what makes that legal rather than
+    /// clever.
+    pub fn datagram_sender(&self) -> DatagramSender {
+        DatagramSender {
+            handle: self.handle.clone(),
+            stream_id: self.stream_id,
+        }
     }
 
     /// Takes the next datagram, waiting for one to arrive.

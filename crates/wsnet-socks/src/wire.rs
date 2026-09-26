@@ -244,6 +244,13 @@ impl Request {
     ///
     /// `ATYP`, `CMD`, and port 0 are rejected here so that a caller only ever
     /// replies, and never allocates a target for, a request the design forbids.
+    ///
+    /// The one exception is RFC 1928's own rule for UDP ASSOCIATE: a client that
+    /// does not yet know which port it will send from is *required* to put "a port
+    /// number and address of all zeros" in the request, so refusing port 0 there
+    /// would break conforming clients. The association takes each datagram's target
+    /// from the datagram's own header anyway, so the request's target is
+    /// informational and nothing is dialled from it.
     pub async fn read<R>(reader: &mut R) -> Result<Self, SocksError>
     where
         R: AsyncRead + Unpin,
@@ -257,7 +264,8 @@ impl Request {
         if head[2] != 0x00 {
             return Err(SocksError::Malformed("request RSV must be zero"));
         }
-        let (target, port) = read_target(reader, head[3]).await?;
+        let allow_zero_port = command == Command::UdpAssociate;
+        let (target, port) = read_target_with(reader, head[3], allow_zero_port).await?;
         Ok(Self {
             command,
             target,
@@ -276,6 +284,21 @@ impl Request {
 
 /// Reads `DST.ADDR, DST.PORT` for a known `ATYP`.
 pub async fn read_target<R>(reader: &mut R, atyp: u8) -> Result<(SocksTarget, u16), SocksError>
+where
+    R: AsyncRead + Unpin,
+{
+    read_target_with(reader, atyp, false).await
+}
+
+/// Reads `DST.ADDR, DST.PORT`, optionally accepting port 0.
+///
+/// Port 0 is not dialable, so it is refused wherever a target will be connected to;
+/// `allow_zero_port` exists only for the request form RFC 1928 defines that way.
+pub async fn read_target_with<R>(
+    reader: &mut R,
+    atyp: u8,
+    allow_zero_port: bool,
+) -> Result<(SocksTarget, u16), SocksError>
 where
     R: AsyncRead + Unpin,
 {
@@ -306,7 +329,7 @@ where
     let mut port = [0u8; 2];
     reader.read_exact(&mut port).await?;
     let port = u16::from_be_bytes(port);
-    if port == 0 {
+    if port == 0 && !allow_zero_port {
         // Port 0 cannot be dialled and is a classic way to smuggle a wildcard
         // intent into a proxy, so it is refused as a request rather than as a
         // later connection failure.

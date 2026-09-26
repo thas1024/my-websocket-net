@@ -62,7 +62,7 @@ pub use config::{IpPrefix, SocksConfig, UserPass};
 pub use error::SocksError;
 pub use server::Socks5Server;
 pub use stats::{Counter, SocksStats, StatsHandle};
-pub use udp::{UdpControl, UdpDatagram, UdpReply};
+pub use udp::{UdpControl, UdpDatagram, UdpReply, UdpReplySender};
 pub use wire::{
     encode_target, encode_udp_datagram, encode_udp_reply, read_target, AuthMethod, Command,
     Credentials, Greeting, Reply, ReplyCode, Request, SocksRequest, SocksTarget, UdpHeader,

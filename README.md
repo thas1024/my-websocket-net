@@ -18,20 +18,23 @@
 | `wsnet-site` | §6.5 §9.1 正常站点与分阶段失败外观 | 完成 |
 | `wsnet-config` | §10 TOML schema 与校验 | 完成 |
 | `wsnet-session` | §4–§7 session 引擎：握手、sealing、replay、流多路复用、credit | 完成；载体无关，可在进程内两端对测 |
-| `wsnet-socks` | §7.4 §7.6 SOCKS5 TCP CONNECT 与 UDP ASSOCIATE 服务端 | 完成（服务端协议与 association 生命周期） |
+| `wsnet-socks` | §7.4 §7.6 SOCKS5 TCP CONNECT 与 UDP ASSOCIATE 服务端 | 完成：TCP CONNECT、UDP ASSOCIATE 的 association 生命周期、来源校验、TTL 与队列预算、RFC 1928 的分片/端口规则 |
 | `wsnet-forward` | §7.6 Local Forward TCP/UDP 与生命周期 | 完成 |
 | `wsnet-control` | USAGE §1–§2 本地管理 IPC | 完成 |
-| `wsnet-node` | §5.3 §5.5 §6 节点客户端：SOCKS5、Local Forward、多 Hub 转移、多跳中间节点 | **部分**：POST+SSE 与 WebSocket 载体均已实现并实测；Hub 会话断线由监督任务按退避重连；`via` 链的中转端已实现；**SOCKS5 UDP ASSOCIATE 未接** |
-| `wsnet-hub` | §4.3 §4.4 §5 §8 §9 §11 Hub 服务端 | **部分**：认证、BindProof、lease、ACL、载体端点、出站数据面、反向访问、§8 `PeerList` 与多跳 chain 均实现；**UDP 出口未实现** |
+| `wsnet-node` | §5.3 §5.5 §6 节点客户端：SOCKS5（TCP + UDP ASSOCIATE）、Local Forward、多 Hub 转移、多跳中间节点 | 完成：POST+SSE 与 WebSocket 载体、断线重连退避、`via` 链中转、UDP association 到隧道 route 的映射 |
+| `wsnet-hub` | §4.3 §4.4 §5 §8 §9 §11 Hub 服务端 | 完成：认证、BindProof、lease、ACL、载体端点、TCP/UDP 出口数据面、反向访问、§8 `PeerList`、多跳 chain |
 | `wsnetd` / `wsnet` 二进制 | USAGE §2 | 完成：`wsnetd check/serve` 与 `wsnet check/run/status/services/forward/keygen` |
 
 ### 已知缺口（明确列出，避免把设计当成已实现）
 
-- **UDP 尚差一段**：`wsnet-socks` 的 UDP ASSOCIATE 服务端、`wsnet-forward` 的 UDP association 表、以及 Hub 的 UDP 出口都已实现并有测试；只差**节点侧把 SOCKS5 association 接到隧道上**。所以 `SocksBridge::udp_associate` 仍以明确的"本版本不支持"拒绝，而不是先答成功再让流量消失。
-  - 已确定并落地的契约：§4.1 的 `Datagram` metadata 增加 `stream_id` —— 该数据报所属的 **UDP route**（§7.4 每个目标一条 route，一条 route 就是一条 UDP 流）；`association_id` 只用于本地把回复送回正确的 SOCKS5 association，不是会话对象。地址以 `host`+`port` 传递，域名保持未解析由出口解析。`DatagramFields` 有往返、缺字段、非法地址（空 host / 0 端口 / 端口越界）的测试。
-  - 节点侧管道：`StreamMsg::Datagram`、`SessionStream::send_datagram` / `recv_datagram`，以及 §7.4 的队列预算（32 条 / 256 KiB，超额丢最旧一条而不是阻塞——UDP 本来没有交付承诺）。测试覆盖"计数预算先绑定"、"字节预算先绑定"、"字节数据与数据报互不吞掉"、"TCP route 上的 Datagram 被丢弃"。
-  - Hub 出口：`spawn_udp_exit` 把一条 route 变成一条 connected UDP socket，两向搬运 datagram，并把**真实响应来源地址**写进回复（§7.4 要求本地侧据此重建 SOCKS5 UDP 头）。测试覆盖真实 socket 上的双向回显、同一 route 只属于一个 association（异己 association 的数据报被丢弃）、TTL 耗尽的数据报被丢弃、以及 §9.3 的出口门禁对 UDP 同样生效（loopback 无显式规则即 Denied 且不注册 stream）。
-  - 仍缺：节点侧 `SocksBridge::udp_associate` —— 每目标一条 route 的映射（上限 64）、来源锁定、`FRAG≠0` 丢弃并计数、60 秒 idle 回收、`socks_udp_advertise`，以及 `udp_enabled` 的接线。
+- **UDP 已打通**：SOCKS5 UDP ASSOCIATE 现在真正把数据报送进隧道。一条 association 绑定创建它的 TCP 控制连接；每个目标一条 **route**（一条 `Proto::Udp` 流），route 到期按 idle 回收，目标数上限 64；队列预算 32 条 / 256 KiB，超额丢最旧一条；`FRAG != 0`、来源不符、来源端口漂移、超长载荷都由 `wsnet-socks` 在交给 handler 之前丢弃并计数；出口只把关联目标的响应转回，并携带**实际响应来源地址**，本地据此重建 SOCKS5 UDP 头。`udp_enabled = false`（默认）时仍以 RFC 的 `CommandNotSupported` 拒绝，而不是先答成功。
+  - 契约上补齐了一处：§4.1 的 `Datagram` metadata 增加 `stream_id`——该数据报所属的 route。没有它两端都无法判断一条数据报属于哪条 route，因为 §7.4 允许一个 association 有多个目标，`association_id` 只是本地把回复送回正确 association 的标签。
+  - 顺带修掉一个协议缺陷：`Request::read` 原先对所有命令都拒绝端口 0，而 RFC 1928 明确要求客户端在还不知道自己将从哪个端口发送时，UDP ASSOCIATE 请求里必须填"全零地址与端口"。现在只有 UDP ASSOCIATE 接受端口 0（该请求的目标本来就是提示性的，真正的目标来自每条数据报的头），CONNECT/BIND 仍然拒绝。
+- **外层 TLS 已用等价实现验证，未用 nginx 实机验证**：本环境没有 nginx，`crates/wsnet-node/tests/tls_front.rs` 用同一个 TLS 库起一个字节级终止代理（不解析 HTTP，因此对 Hub 完全透明），断言整条载体在 TLS 后可用，并断言**默认信任库下同一个部署必须失败**——后者保证证书校验真的在跑，而不是被静默放过。运营商自建 CA 通过 `HttpTransportFactory::with_root_certificate` 接入。`wss://` 的自定义根尚未接线（WebSocket 载体只走公开根）。
+- **WebSocket 载体的健康检查是"载体级"的**：§5.5 要的是一次认证往返。节点的探测顺序是先用 `BindProof` 做一次真实 upgrade（Hub 校验 MAC、nonce、会话存在），只有在它失败时才退回在现役 socket 上做控制帧往返。Hub 侧只有"认证出该会话的那个 socket"结束时才释放租约，所以探测可以来去而不打断会话——这一点由 `tests/ws_carrier.rs` 断言。
+- `services list` 报告的是**Hub 按调用方 ACL 过滤后**广播的 `PeerList`，加上本节点自己发布、而 Hub 尚未回显的条目（后者按 Hub 是否已发过快照标 `Ready`/`Offline`）。节点不会伪造它看不到的远端目录。
+- `wsnet-auth-store` 的持久化与多实例共享未接；Hub 重启后 replay 窗口与 nonce 登记从零开始。
+- UDP 在可靠 TLS 载体上仍会受 TCP 队头阻塞影响，实时性不保证（§7.4 的既有结论，不是缺陷）。
 - **外层 TLS 已用等价实现验证，未用 nginx 实机验证**：本环境没有 nginx，`crates/wsnet-node/tests/tls_front.rs` 用同一个 TLS 库起一个字节级终止代理（不解析 HTTP，因此对 Hub 完全透明），断言整条载体在 TLS 后可用，并断言**默认信任库下同一个部署必须失败**——后者保证证书校验真的在跑，而不是被静默放过。运营商自建 CA 通过 `HttpTransportFactory::with_root_certificate` 接入。`wss://` 的自定义根尚未接线（WebSocket 载体只走公开根）。
 - **WebSocket 载体的健康检查是"载体级"的**：§5.5 要的是一次认证往返。节点的探测顺序是先用 `BindProof` 做一次真实 upgrade（Hub 校验 MAC、nonce、会话存在），只有在它失败时才退回在现役 socket 上做控制帧往返。Hub 侧只有"认证出该会话的那个 socket"结束时才释放租约，所以探测可以来去而不打断会话——这一点由 `tests/ws_carrier.rs` 断言。
 - `services list` 报告的是**Hub 按调用方 ACL 过滤后**广播的 `PeerList`，加上本节点自己发布、而 Hub 尚未回显的条目（后者按 Hub 是否已发过快照标 `Ready`/`Offline`）。节点不会伪造它看不到的远端目录。
@@ -39,7 +42,7 @@
 
 ### 实测记录
 
-`cargo test --workspace` 为 **621 passed / 0 failed**（连续两轮），`cargo clippy --workspace --all-targets -- -D warnings` 干净。
+`cargo test --workspace` 为 **624 passed / 0 failed**，`cargo clippy --workspace --all-targets -- -D warnings` 干净。
 
 **端到端验收**（均真实进程内跑真 Hub + 真节点，无桩）：
 
@@ -48,6 +51,7 @@
 - `crates/wsnet-node/tests/multihop.rs`：`via=[A]` 把出口移到 A；`via=[A,B]` 走 client→H→A→H→B→target 的星型回转链；两条负例分别钉住"出口节点自身白名单"和"中间节点的本地同意"（`relay_forward` 默认关闭）。
 - `crates/wsnet-node/tests/ws_carrier.rs`：强制使用 WebSocket 工厂，断言字节回显、健康检查不打断会话、第二条连接仍然可用。
 - `crates/wsnet-node/tests/tls_front.rs`：TLS 终止代理前后各一条（可用 / 不可信必须被拒）。
+- `crates/wsnet-node/tests/udp_associate.rs`：SOCKS5 UDP 客户端的数据报经 node → 隧道 route → Hub UDP 出口 → 真实 UDP socket 回显，答案回来时带真实来源地址；`udp_enabled = false` 时同一条请求必须得到 RFC 的 `CommandNotSupported`。
 - `crates/wsnet-node/tests/peer_directory.rs`：Hub 的 `PeerList` 在注册后立即到达调用方；无规则的节点看到的是**已知但为空**的目录，而不是泄漏；发布方退租后服务消失且版本号单调递增。
 - `crates/wsnet-node/tests/supervisor.rs`：Hub 被杀后监督任务按 §5.5 的三次失败判定并重连；多 Hub 下新连接转移到第二个 Hub（用"第一个 Hub 必然拒绝、第二个必然成功"来证明选中的是哪个）。
 - `crates/wsnet-limits/tests/budgets.rs`：把 replay 窗口、nonce 容量、重排字节/块/前视、credit、载体与 metadata 尺寸逐项压到恰好命中与超出一字节。

@@ -42,6 +42,7 @@ pub mod node;
 pub mod select;
 pub mod socks;
 pub mod stream;
+pub mod udp;
 pub mod ws;
 
 pub use carrier::{CarrierIo, CarrierKind};
@@ -57,7 +58,8 @@ pub use inbound::{
 pub use node::{FlowOpener, Node, NodeError, NodeOptions, NodeRuntime};
 pub use select::{select_hub, Candidate, HubChoice, ServiceDirectory};
 pub use socks::{destination_for, SocksBridge};
-pub use stream::SessionStream;
+pub use stream::{DatagramSender, SessionStream};
+pub use udp::UdpAssociation;
 pub use ws::{factory_for, WsTransport, WsTransportFactory};
 
 /// A boxed, `Send`, borrowing future.

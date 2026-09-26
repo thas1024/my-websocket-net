@@ -12,6 +12,7 @@
 //!   (section 9.1).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::debug;
 
@@ -23,6 +24,7 @@ use wsnet_socks::{
 
 use crate::node::{FlowOpener, NodeError};
 use crate::select::HubChoice;
+use crate::udp::UdpAssociation;
 
 /// The `Open` destination a SOCKS5 request asks for.
 ///
@@ -40,12 +42,23 @@ pub fn destination_for(request: &SocksRequest) -> Destination {
 /// Serves inbound SOCKS5 connections out of hub sessions.
 pub struct SocksBridge {
     opener: Arc<dyn FlowOpener>,
+    /// How long one UDP route may go unused before it is reclaimed (section 7.4).
+    udp_idle_timeout: Duration,
 }
 
 impl SocksBridge {
     /// Builds a handler that opens flows through `opener`.
     pub fn new(opener: Arc<dyn FlowOpener>) -> Self {
-        SocksBridge { opener }
+        SocksBridge {
+            opener,
+            udp_idle_timeout: Duration::from_secs(wsnet_limits::UDP_ASSOCIATION_IDLE_SECS),
+        }
+    }
+
+    /// Overrides the idle timeout applied to one UDP route, for tests.
+    pub fn with_udp_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.udp_idle_timeout = timeout;
+        self
     }
 }
 
@@ -77,18 +90,24 @@ impl SocksHandler for SocksBridge {
         })
     }
 
-    /// Answers a UDP ASSOCIATE with the RFC's "command not supported".
+    /// Serves one UDP ASSOCIATE by mapping every target onto a tunnel route
+    /// (DESIGN.md section 7.4).
     ///
-    /// This node does not carry datagrams yet, so claiming an association would
-    /// be a success the node cannot back (DESIGN.md section 7.4 is not
-    /// implemented here); the listener therefore also disables it up front.
+    /// The association lives exactly as long as the TCP control connection that
+    /// requested it: the server tears the local mapping down and signals the close,
+    /// which ends this future and, with it, every route it opened.
     fn udp_associate(
         &self,
-        mut control: UdpControl,
+        control: UdpControl,
     ) -> HandlerFuture<'static, Result<(), SocksError>> {
+        let association = UdpAssociation::new(
+            &control,
+            Arc::clone(&self.opener),
+            self.udp_idle_timeout,
+        );
         Box::pin(async move {
-            while control.recv().await.is_some() {}
-            Err(SocksError::UdpDisabled)
+            association.run(control).await;
+            Ok(())
         })
     }
 }

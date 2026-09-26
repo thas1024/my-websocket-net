@@ -827,7 +827,12 @@ fn build_socks_config(
         .collect();
     let mut socks = SocksConfig::new();
     socks.loopback_only = false;
-    socks.udp_enabled = false;
+    // Section 7.4 makes datagram inbound a deployment decision, and section 10's
+    // sample sets it explicitly; the schema already refuses a UDP service unless it
+    // is on, so this is the same switch rather than a second one.
+    socks.udp_enabled = config.client.udp_enabled;
+    socks.max_udp_payload = config.client.udp_max_payload_bytes;
+    socks.udp_queue_ttl = Duration::from_millis(config.client.udp_queue_ttl_ms);
     socks.userpass = options.socks_userpass.clone();
     socks.source_allowlist = allowlist?;
     match socks.validate_for(listen) {

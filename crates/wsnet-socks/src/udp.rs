@@ -202,6 +202,49 @@ impl UdpControl {
     pub fn is_closed(&self) -> bool {
         *self.closed.borrow()
     }
+
+    /// Borrows a handle that can answer this association from another task.
+    ///
+    /// Section 7.4 gives one association up to 64 targets, each with its own
+    /// route, so a handler that serves those routes with one task each has to be
+    /// able to answer the association from them. The control value itself stays
+    /// with the task that reads the client's datagrams, because its receive half
+    /// cannot be duplicated.
+    pub fn reply_sender(&self) -> UdpReplySender {
+        UdpReplySender {
+            replies: self.replies.clone(),
+            counters: Arc::clone(&self.counters),
+            closed: self.closed.clone(),
+        }
+    }
+}
+
+/// A cloneable way to answer one association (section 7.4).
+#[derive(Clone)]
+pub struct UdpReplySender {
+    replies: mpsc::Sender<UdpReply>,
+    counters: Arc<Counters>,
+    closed: watch::Receiver<bool>,
+}
+
+impl UdpReplySender {
+    /// Hands one reply to the association, waiting for queue capacity.
+    pub async fn send(&self, reply: UdpReply) -> Result<(), SocksError> {
+        self.replies
+            .send(reply)
+            .await
+            .map_err(|_| SocksError::AssociationClosed)
+    }
+
+    /// Whether the association has already ended.
+    pub fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
+    /// Records one event in the shared statistics, for drops this side decides on.
+    pub fn count(&self, counter: Counter) {
+        self.counters.inc(counter);
+    }
 }
 
 /// Everything one UDP association needs from its server.
