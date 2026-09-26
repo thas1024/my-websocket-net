@@ -30,10 +30,16 @@ fn psk_hex() -> String {
     PSK.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// A per-run scratch directory for the key file both sides read.
-fn scratch_dir() -> PathBuf {
+/// A per-test scratch directory for the key file both sides read.
+///
+/// The test name is part of the path on purpose: the tests in one binary run in
+/// parallel threads of the same process, so a directory keyed only by the process id
+/// is shared, and one test's cleanup deletes the file another test is about to read
+/// (`BadSecret`). Isolation here is the difference between a real failure and a
+/// scheduling accident.
+fn scratch_dir(name: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
-    dir.push(format!("wsnet-acceptance-{}", std::process::id()));
+    dir.push(format!("wsnet-acceptance-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch directory");
     dir
 }
@@ -153,7 +159,7 @@ async fn spawn_echo_target() -> std::net::SocketAddr {
 /// The whole chain: SOCKS5 client to node to Hub to target and back.
 #[tokio::test]
 async fn a_socks5_request_traverses_the_node_and_the_hub_to_a_target() {
-    let scratch = scratch_dir();
+    let scratch = scratch_dir("traverse");
     let key_path = scratch.join("client-a.key");
     std::fs::write(&key_path, psk_hex()).expect("write the shared key");
 
@@ -277,7 +283,7 @@ target = "127.0.0.1:8080"
 /// did not take the session with it.
 #[tokio::test]
 async fn a_second_request_reuses_the_same_session() {
-    let scratch = scratch_dir();
+    let scratch = scratch_dir("reuse");
     let key_path = scratch.join("client-a.key");
     std::fs::write(&key_path, psk_hex()).expect("write the shared key");
 

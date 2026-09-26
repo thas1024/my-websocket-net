@@ -27,10 +27,11 @@
 
 ### 已知缺口（明确列出，避免把设计当成已实现）
 
-- **UDP 尚未打通**：`wsnet-socks` 的 UDP ASSOCIATE 服务端、`wsnet-forward` 的 UDP association 表都有测试，但节点还没有把 datagram 送进隧道的入口，Hub 出口也只拨 TCP。因此 `SocksBridge::udp_associate` 仍以明确的"本版本不支持"拒绝，而不是先答成功再让流量消失。
-  - 已确定并落地的契约：§4.1 的 `Datagram` metadata 增加 `stream_id` —— 该数据报所属的 **UDP route**（§7.4 每个目标一条 route，一条 route 就是一条 UDP 流）；`association_id` 只用于本地把回复送回正确的 SOCKS5 association，不是会话对象。地址以 `host`+`port` 传递，域名保持未解析由出口解析。`DatagramFields` 已实现并有往返、缺字段、非法地址（空 host / 0 端口 / 端口越界）的测试。
-  - 已落地的节点侧管道：`StreamMsg::Datagram`、`SessionStream::send_datagram` / `recv_datagram`，以及 §7.4 的队列预算（每 association 32 条 / 256 KiB，超额丢最旧一条而不是阻塞——UDP 本来没有交付承诺）。测试覆盖"计数预算先绑定"、"字节预算先绑定"、"字节数据与数据报互不吞掉"。
-  - 仍缺两段：Hub 的 **UDP 出口**（`spawn_hub_exit` 只拨 TCP）与节点 **SOCKS5 UDP association**（每目标一条 route、来源锁定、`FRAG≠0` 丢弃并计数、60 秒 idle、`socks_udp_advertise`）。两段都做完才谈得上端到端可用。
+- **UDP 尚差一段**：`wsnet-socks` 的 UDP ASSOCIATE 服务端、`wsnet-forward` 的 UDP association 表、以及 Hub 的 UDP 出口都已实现并有测试；只差**节点侧把 SOCKS5 association 接到隧道上**。所以 `SocksBridge::udp_associate` 仍以明确的"本版本不支持"拒绝，而不是先答成功再让流量消失。
+  - 已确定并落地的契约：§4.1 的 `Datagram` metadata 增加 `stream_id` —— 该数据报所属的 **UDP route**（§7.4 每个目标一条 route，一条 route 就是一条 UDP 流）；`association_id` 只用于本地把回复送回正确的 SOCKS5 association，不是会话对象。地址以 `host`+`port` 传递，域名保持未解析由出口解析。`DatagramFields` 有往返、缺字段、非法地址（空 host / 0 端口 / 端口越界）的测试。
+  - 节点侧管道：`StreamMsg::Datagram`、`SessionStream::send_datagram` / `recv_datagram`，以及 §7.4 的队列预算（32 条 / 256 KiB，超额丢最旧一条而不是阻塞——UDP 本来没有交付承诺）。测试覆盖"计数预算先绑定"、"字节预算先绑定"、"字节数据与数据报互不吞掉"、"TCP route 上的 Datagram 被丢弃"。
+  - Hub 出口：`spawn_udp_exit` 把一条 route 变成一条 connected UDP socket，两向搬运 datagram，并把**真实响应来源地址**写进回复（§7.4 要求本地侧据此重建 SOCKS5 UDP 头）。测试覆盖真实 socket 上的双向回显、同一 route 只属于一个 association（异己 association 的数据报被丢弃）、TTL 耗尽的数据报被丢弃、以及 §9.3 的出口门禁对 UDP 同样生效（loopback 无显式规则即 Denied 且不注册 stream）。
+  - 仍缺：节点侧 `SocksBridge::udp_associate` —— 每目标一条 route 的映射（上限 64）、来源锁定、`FRAG≠0` 丢弃并计数、60 秒 idle 回收、`socks_udp_advertise`，以及 `udp_enabled` 的接线。
 - **外层 TLS 已用等价实现验证，未用 nginx 实机验证**：本环境没有 nginx，`crates/wsnet-node/tests/tls_front.rs` 用同一个 TLS 库起一个字节级终止代理（不解析 HTTP，因此对 Hub 完全透明），断言整条载体在 TLS 后可用，并断言**默认信任库下同一个部署必须失败**——后者保证证书校验真的在跑，而不是被静默放过。运营商自建 CA 通过 `HttpTransportFactory::with_root_certificate` 接入。`wss://` 的自定义根尚未接线（WebSocket 载体只走公开根）。
 - **WebSocket 载体的健康检查是"载体级"的**：§5.5 要的是一次认证往返。节点的探测顺序是先用 `BindProof` 做一次真实 upgrade（Hub 校验 MAC、nonce、会话存在），只有在它失败时才退回在现役 socket 上做控制帧往返。Hub 侧只有"认证出该会话的那个 socket"结束时才释放租约，所以探测可以来去而不打断会话——这一点由 `tests/ws_carrier.rs` 断言。
 - `services list` 报告的是**Hub 按调用方 ACL 过滤后**广播的 `PeerList`，加上本节点自己发布、而 Hub 尚未回显的条目（后者按 Hub 是否已发过快照标 `Ready`/`Offline`）。节点不会伪造它看不到的远端目录。
@@ -38,7 +39,7 @@
 
 ### 实测记录
 
-`cargo test --workspace` 为 **613 passed / 0 failed**，`cargo clippy --workspace --all-targets -- -D warnings` 干净。
+`cargo test --workspace` 为 **621 passed / 0 failed**（连续两轮），`cargo clippy --workspace --all-targets -- -D warnings` 干净。
 
 **端到端验收**（均真实进程内跑真 Hub + 真节点，无桩）：
 
@@ -59,7 +60,10 @@
 2. **§7.3 的三个重排预算只有声明没有实现**：`REORDER_MAX_BLOCKS`（128 块）与 `REORDER_MAX_OUT_OF_ORDER_BYTES`（128 KiB）在整个工作区没有任何代码引用，`ReorderBuffer` 只按总字节（256 KiB）设限，且对 offset 前视**完全没有**约束——对端可以在 offset 2^40 放一个 4 字节块，或塞进 129 个带洞的小块。现在三个预算都强制，并且 `with_limit` 被夹在 §7.3 的每方向总量之下。
 3. **同一会话上第二个 `/w` 结束会杀掉会话**：会话表原先只支持单个 SSE owner，WebSocket 侧没有任何 owner 概念，于是任何一次带合法 `BindProof` 的 upgrade 结束时都会 `close_session`。这与 §6.2 "同一会话可有多个载体"的模型矛盾，也让"认证式健康探测"变成自杀操作。现在只有认证出该会话的那个 socket 结束时才释放租约。
 
-此外，`wsnet-forward/tests/lifecycle.rs` 原先用 2 秒 connect 上限 + 30 毫秒固定 sleep，在机器负载高时会假失败。这些断言关心的是字节与拨号次数，不是延迟，因此改为具名常量（15 秒 / 200 毫秒）并在注释里说明它们是"卡死检测"而不是性能断言。
+此外，测试之间的隔离问题也被修掉，它们此前是"偶发失败"的来源：
+
+- `end_to_end.rs` 与 `reverse_access.rs` 的多条测试共用同一个 `{进程 id}` 临时目录和同一个密钥文件名，而这些测试在同一个进程的并行线程里跑：一条测试收尾时 `remove_file`，另一条正要读同一个文件，于是偶发 `BadSecret`。现在路径里带上测试名。
+- `wsnet-forward/tests/lifecycle.rs` 原先用 2 秒 connect 上限 + 30 毫秒固定 sleep，在机器负载高时会假失败。这些断言关心的是字节与拨号次数，不是延迟，因此改为具名常量（15 秒 / 200 毫秒）并在注释里说明它们是"卡死检测"而不是性能断言。
 
 > Windows 提示：配置里的路径若含反斜杠需写成 `C:/...` 或 TOML 字面串 `'C:\...'`，否则会被当作转义序列（`invalid unicode 8-digit hex code`）。
 

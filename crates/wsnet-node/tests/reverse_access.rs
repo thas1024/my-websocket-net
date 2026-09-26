@@ -55,9 +55,9 @@ fn psk_hex() -> String {
     PSK.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn scratch_dir() -> PathBuf {
+fn scratch_dir(name: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
-    dir.push(format!("wsnet-reverse-{}", std::process::id()));
+    dir.push(format!("wsnet-reverse-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch directory");
     dir
 }
@@ -126,7 +126,7 @@ async fn wait_until_ready(node: &Arc<Node>, hub_id: &str) {
 #[tokio::test]
 async fn a_caller_reaches_a_publishers_service_through_local_forward() {
     init_tracing();
-    let scratch = scratch_dir();
+    let scratch = scratch_dir("reach");
     let key_path = scratch.join("publisher.key");
     std::fs::write(&key_path, psk_hex()).expect("write the shared key");
 
@@ -284,7 +284,7 @@ destination = {{ type = "service", node = "publisher", name = "web" }}
 #[tokio::test]
 async fn the_forward_keeps_working_for_later_connections() {
     init_tracing();
-    let scratch = scratch_dir();
+    let scratch = scratch_dir("repeat");
     let key_path = scratch.join("publisher.key");
     std::fs::write(&key_path, psk_hex()).expect("write the shared key");
     let target = spawn_echo_target().await;
@@ -423,7 +423,7 @@ destination = {{ type = "service", node = "publisher", name = "web" }}
 #[tokio::test]
 async fn a_publishers_allowlist_admits_an_explicit_node_address() {
     init_tracing();
-    let scratch = scratch_dir();
+    let scratch = scratch_dir("allowlist");
     let key_path = scratch.join("publisher.key");
     std::fs::write(&key_path, psk_hex()).expect("write the shared key");
 

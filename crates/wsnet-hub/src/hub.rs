@@ -42,7 +42,7 @@ use wsnet_registry::{PeerList, Registry};
 use wsnet_routing::{validate_chain, AclQuery, AclTable, Destination, RelayAllow, RouteError};
 use wsnet_session::{
     authok_mac, fresh_epoch, fresh_nonce, fresh_session_id, negotiate_capabilities, session_keys,
-    verify_auth, AuthFields, AuthOkFields, HelloFields, HelloOkFields, OpenFields,
+    verify_auth, AuthFields, AuthOkFields, DatagramFields, HelloFields, HelloOkFields, OpenFields,
     OpenResultFields, OpenStatus, ResetReason, Session, SessionConfig, SessionError, SessionState,
     Side,
 };
@@ -941,13 +941,21 @@ impl Hub {
                 // socket rather than to the session's business logic.
                 self.on_stream_event(entry, event);
             }
-            Event::Datagram { .. } => {
-                // Section 7.4: a datagram with no association is dropped and
-                // counted; it never dials anything on its own.
-                tracing::debug!(
-                    session = %hex::encode(entry.session_id),
-                    "dropping a datagram for an unimplemented association"
-                );
+            Event::Datagram { metadata, payload } => {
+                // Section 4.1 puts the route in the datagram's own metadata, so a
+                // datagram whose metadata does not name a live route is dropped and
+                // logged rather than answered (section 7.4 drops an unmapped
+                // datagram instead of inventing an association for it).
+                match DatagramFields::from_canonical(&metadata) {
+                    Ok(fields) => {
+                        self.route_datagram(entry, fields.stream_id, Event::Datagram { metadata, payload })
+                    }
+                    Err(error) => tracing::debug!(
+                        session = %hex::encode(entry.session_id),
+                        %error,
+                        "dropping a datagram whose metadata does not parse"
+                    ),
+                }
             }
             Event::StateChanged(state) => {
                 tracing::trace!(
@@ -970,6 +978,23 @@ impl Hub {
                 );
             }
         }
+    }
+
+    /// Routes one datagram to the task that owns its route (section 7.4).
+    ///
+    /// A route is a task, so this is the same routing rule as any other stream
+    /// event; the difference is only that the stream id has to be read out of the
+    /// datagram's metadata first, because a `Datagram` record carries no `Data`
+    /// style envelope of its own.
+    fn route_datagram(&self, entry: &SharedSession, stream_id: u64, event: wsnet_session::SessionEvent) {
+        if entry.route_stream_event(stream_id, event) {
+            return;
+        }
+        tracing::debug!(
+            session = %hex::encode(entry.session_id),
+            stream_id,
+            "dropping a datagram for a route that is not live"
+        );
     }
 
     /// Routes one stream event to its task, or refuses the stream (section 8).

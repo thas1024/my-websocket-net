@@ -24,13 +24,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{lookup_host, TcpStream};
+use tokio::net::{lookup_host, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
-use wsnet_limits::MAX_TCP_PAYLOAD;
+use wsnet_limits::{MAX_TCP_PAYLOAD, MAX_UDP_PAYLOAD, UDP_QUEUE_TTL_DEFAULT_MS};
 use wsnet_routing::{AclAction, AclQuery, Proto};
 use wsnet_session::{
-    OpenFields, OpenResultFields, OpenStatus, ResetReason, SessionError, SessionEvent,
-    SessionHandle,
+    DatagramFields, OpenFields, OpenResultFields, OpenStatus, ResetReason, SessionError,
+    SessionEvent, SessionHandle,
 };
 use wsnet_stream::StreamError;
 
@@ -61,6 +61,9 @@ const DETAIL_NO_RUNTIME: &str = "hub exit needs an async runtime to dial";
 /// nothing to diagnose, but an empty field is indistinguishable from a producer
 /// that never filled it in, so a short note is more useful.
 const DETAIL_CONNECTED: &str = "hub exit connected";
+
+/// Detail reported with a successful `OpenResult` for a UDP route (section 7.4).
+const DETAIL_UDP_ROUTE_READY: &str = "hub udp route ready";
 
 /// Why a Hub exit could not produce a socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +96,15 @@ pub(crate) fn spawn_hub_exit(
     host: String,
     port: u16,
 ) {
+    // Section 7.4 gives UDP its own carrier shape: one route is one connected
+    // socket, and its traffic travels in `Datagram` records rather than in the
+    // ordered byte stream. Dispatching here keeps the decision in one place — the
+    // `Open` is already authorised by the time either task runs.
+    if fields.proto == Proto::Udp {
+        spawn_udp_exit(hub, entry, fields, host, port);
+        return;
+    }
+
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         // Answering rather than panicking keeps a Hub that is driven from a
         // synchronous caller diagnosable instead of aborting the process.
@@ -488,9 +500,338 @@ impl HubExit {
     }
 }
 
+/// Spawns the task that serves one authorised UDP route (section 7.4).
+///
+/// A route is one connected socket towards one target, which is what makes the
+/// per-association, per-target mapping of section 7.4 a mapping from a route to a
+/// socket: a response can only arrive from the target this route was opened for, so
+/// an unrelated peer cannot inject one.
+pub(crate) fn spawn_udp_exit(
+    hub: &Hub,
+    entry: &SharedSession,
+    fields: &OpenFields,
+    host: String,
+    port: u16,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        hub.refuse_open(entry, fields, OpenStatus::Unreachable, DETAIL_NO_RUNTIME);
+        return;
+    };
+
+    let (sink, events) = mpsc::unbounded_channel();
+    if !entry.claim_stream(fields.stream_id, sink) {
+        tracing::debug!(
+            session = %hex::encode(entry.session_id),
+            stream_id = fields.stream_id,
+            "refusing a second route for a live stream"
+        );
+        return;
+    }
+
+    let exit = UdpExit {
+        session: Arc::clone(entry),
+        handle: entry.handle.clone(),
+        policy: hub.egress_policy().clone(),
+        caller: entry.node_id.clone(),
+        request_id: fields.request_id,
+        stream_id: fields.stream_id,
+        host,
+        port,
+    };
+    tracing::debug!(
+        session = %hex::encode(entry.session_id),
+        stream_id = fields.stream_id,
+        "hub udp route dialling"
+    );
+    runtime.spawn(async move { exit.run(events).await });
+}
+
+/// One Hub-exit UDP route.
+struct UdpExit {
+    /// The session the route belongs to, for routing and publishing records.
+    session: SharedSession,
+    /// The engine handle, for `Datagram`, `OpenResult`, and `Reset`.
+    handle: SessionHandle,
+    /// Section 9.3's egress policy, derived from the deployment's ACL.
+    policy: EgressPolicy,
+    /// Who opened the route; the ACL is per caller.
+    caller: String,
+    /// Operation id, echoed in the answer.
+    request_id: [u8; 16],
+    /// Route being served.
+    stream_id: u64,
+    /// Host exactly as the caller wrote it.
+    host: String,
+    /// Destination port.
+    port: u16,
+}
+
+impl UdpExit {
+    /// The ACL question for one concrete candidate address.
+    fn query(&self, ip: IpAddr) -> AclQuery<'_> {
+        AclQuery {
+            caller: &self.caller,
+            action: AclAction::ConnectAddress,
+            node: None,
+            service: None,
+            ip: Some(ip),
+            port: Some(self.port),
+            proto: Proto::Udp,
+        }
+    }
+
+    /// Resolves, answers, pumps, and then leaves nothing registered.
+    async fn run(self, mut events: mpsc::UnboundedReceiver<SessionEvent>) {
+        match self.dial().await {
+            Err(failure) => self.refuse(failure),
+            Ok(socket) => {
+                if self.answer_ok() {
+                    self.session.flush_outbound();
+                    self.pump(socket, &mut events).await;
+                }
+            }
+        }
+        self.session.unregister_stream(self.stream_id);
+        self.handle.close_stream(self.stream_id);
+        self.session.flush_outbound();
+    }
+
+    /// Resolves the name, checks every candidate, and connects to a checked one.
+    ///
+    /// The order is section 9.3's: the address that is connected to is the address
+    /// that was checked, resolved once rather than re-resolved at connect time.
+    ///
+    /// Unlike TCP there is no handshake to fail, so `connect` on a UDP socket only
+    /// fixes the peer. An unreachable target therefore does not surface here; its
+    /// datagrams are simply lost, which is what section 7.4 means when it says UDP
+    /// carries no delivery promise.
+    async fn dial(&self) -> Result<UdpSocket, DialFailure> {
+        let resolved = tokio::time::timeout(
+            EGRESS_CONNECT_TIMEOUT,
+            lookup_host((self.host.as_str(), self.port)),
+        )
+        .await;
+        let candidates: Vec<SocketAddr> = match resolved {
+            Ok(Ok(candidates)) => candidates.collect(),
+            Ok(Err(error)) => {
+                return Err(DialFailure::new(
+                    OpenStatus::Unreachable,
+                    format!("cannot resolve the destination: {error}"),
+                ))
+            }
+            Err(_) => {
+                return Err(DialFailure::new(
+                    OpenStatus::Unreachable,
+                    "resolving the destination timed out",
+                ))
+            }
+        };
+
+        let mut last: Option<DialFailure> = None;
+        for candidate in candidates {
+            if let Err(refusal) = self
+                .policy
+                .check(&self.query(candidate.ip()), candidate.ip())
+            {
+                tracing::debug!(
+                    session = %hex::encode(self.session.session_id),
+                    stream_id = self.stream_id,
+                    "egress guard refused a udp candidate address"
+                );
+                last = Some(DialFailure::new(OpenStatus::Denied, refusal.detail()));
+                continue;
+            }
+            // The local address is chosen by the OS: a UDP route has no listening
+            // socket, and binding one explicitly would only invite a port
+            // collision.
+            let bind: SocketAddr = if candidate.is_ipv4() {
+                "0.0.0.0:0".parse().expect("a valid wildcard address")
+            } else {
+                "[::]:0".parse().expect("a valid wildcard address")
+            };
+            match UdpSocket::bind(bind).await {
+                Ok(socket) => match socket.connect(candidate).await {
+                    Ok(()) => return Ok(socket),
+                    Err(error) => {
+                        last = Some(DialFailure::new(
+                            OpenStatus::Unreachable,
+                            format!("cannot connect the udp socket: {error:?}"),
+                        ));
+                    }
+                },
+                Err(error) => {
+                    last = Some(DialFailure::new(
+                        OpenStatus::Unreachable,
+                        format!("cannot bind a udp socket: {error:?}"),
+                    ));
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            DialFailure::new(OpenStatus::Unreachable, "the destination is unreachable")
+        }))
+    }
+
+    /// Reports a failure to the peer; the engine drops the route's state.
+    fn refuse(&self, failure: DialFailure) {
+        let result = OpenResultFields {
+            request_id: self.request_id,
+            stream_id: self.stream_id,
+            status: failure.status,
+            detail: failure.detail,
+        };
+        if let Err(error) = self.handle.send_open_result(&result) {
+            tracing::debug!(
+                session = %hex::encode(self.session.session_id),
+                stream_id = self.stream_id,
+                %error,
+                "cannot answer a refused Open"
+            );
+        }
+        self.session.flush_outbound();
+    }
+
+    /// Installs the route and answers `OpenResult{Ok}` plus `Ready`.
+    fn answer_ok(&self) -> bool {
+        let result = OpenResultFields {
+            request_id: self.request_id,
+            stream_id: self.stream_id,
+            status: OpenStatus::Ok,
+            detail: DETAIL_UDP_ROUTE_READY.to_string(),
+        };
+        match self.handle.send_open_result(&result) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::debug!(
+                    session = %hex::encode(self.session.session_id),
+                    stream_id = self.stream_id,
+                    %error,
+                    "cannot answer Open"
+                );
+                false
+            }
+        }
+    }
+
+    /// Moves datagrams in both directions until the route ends.
+    ///
+    /// One association owns a route, which is what lets the reply carry the
+    /// association id the caller needs without the Hub having to trust a number it
+    /// was handed: the first datagram fixes it, and a later one claiming a different
+    /// association is dropped rather than re-homed.
+    async fn pump(&self, socket: UdpSocket, events: &mut mpsc::UnboundedReceiver<SessionEvent>) {
+        let mut buffer = vec![0u8; MAX_UDP_PAYLOAD];
+        let mut association: Option<u64> = None;
+        let mut next_id: u64 = 0;
+
+        loop {
+            tokio::select! {
+                received = socket.recv_from(&mut buffer) => {
+                    let Ok((len, source)) = received else {
+                        // A connected UDP socket reports an ICMP error from the peer
+                        // here. The route stays open: a later datagram may still
+                        // reach the target, and closing would turn one lost packet
+                        // into a lost route.
+                        tracing::trace!(
+                            stream_id = self.stream_id,
+                            "a udp route saw an error from its target"
+                        );
+                        continue;
+                    };
+                    let Some(association_id) = association else {
+                        continue;
+                    };
+                    // Section 4.1 forbids wrapping a datagram id, so a route that
+                    // exhausts the space ends instead of reusing an id.
+                    let Some(datagram_id) = next_id.checked_add(1) else {
+                        tracing::debug!(
+                            stream_id = self.stream_id,
+                            "a udp route exhausted its datagram ids"
+                        );
+                        return;
+                    };
+                    next_id = datagram_id;
+
+                    // Section 7.4: the response travels back with the address it
+                    // actually came from, so the local side can rebuild the SOCKS5
+                    // header rather than claiming the original destination answered.
+                    let fields = DatagramFields {
+                        stream_id: self.stream_id,
+                        association_id,
+                        datagram_id,
+                        host: source.ip().to_string(),
+                        port: source.port(),
+                        remaining_ttl_ms: UDP_QUEUE_TTL_DEFAULT_MS,
+                    };
+                    if let Err(error) = self
+                        .handle
+                        .send_datagram(fields.to_canonical(), buffer[..len].to_vec())
+                    {
+                        tracing::debug!(
+                            stream_id = self.stream_id,
+                            %error,
+                            "cannot send a datagram response"
+                        );
+                        return;
+                    }
+                    self.session.flush_outbound();
+                }
+                event = events.recv() => match event {
+                    Some(SessionEvent::Datagram { metadata, payload }) => {
+                        let Ok(fields) = DatagramFields::from_canonical(&metadata) else {
+                            tracing::debug!(
+                                stream_id = self.stream_id,
+                                "dropping a datagram whose metadata does not parse"
+                            );
+                            continue;
+                        };
+                        if fields.stream_id != self.stream_id {
+                            continue;
+                        }
+                        match association {
+                            None => association = Some(fields.association_id),
+                            Some(known) if known != fields.association_id => {
+                                tracing::debug!(
+                                    stream_id = self.stream_id,
+                                    "dropping a datagram for another association"
+                                );
+                                continue;
+                            }
+                            Some(_) => {}
+                        }
+                        // Section 7.4: a datagram whose queue budget is spent is
+                        // dropped rather than sent late, and never requeued.
+                        if fields.remaining_ttl_ms == 0 {
+                            tracing::debug!(
+                                stream_id = self.stream_id,
+                                "dropping an expired datagram"
+                            );
+                            continue;
+                        }
+                        if let Err(error) = socket.send(&payload).await {
+                            tracing::debug!(
+                                stream_id = self.stream_id,
+                                %error,
+                                "a udp route could not reach its target"
+                            );
+                        }
+                    }
+                    // A half-close is not meaningful for datagrams, so either
+                    // terminal event ends the route.
+                    Some(SessionEvent::Fin(fields)) if fields.stream_id == self.stream_id => return,
+                    Some(SessionEvent::Reset(fields)) if fields.stream_id == self.stream_id => {
+                        return
+                    }
+                    Some(_) => {}
+                    None => return,
+                },
+            }
+        }
+    }
+}
+
 #[cfg(test)]
-pub(crate) mod tests {
-    use std::future::Future;
+pub(crate) mod tests {    use std::future::Future;
     use std::net::IpAddr;
     use std::time::Duration;
 
@@ -821,8 +1162,171 @@ pub(crate) mod tests {
     }
 
     /// A loopback listener that accepts once and returns both halves.
-    async fn bind_listener() -> (TcpListener, u16) {
-        let listener = TcpListener::bind("127.0.0.1:0")
+    /// A loopback UDP echo target: whatever it receives, it sends back.
+    ///
+    /// The socket moves into the task that serves it, which is also what keeps it
+    /// alive: the caller only needs the port it bound.
+    async fn bind_udp_echo() -> u16 {
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback udp socket");
+        let port = socket.local_addr().expect("a bound address").port();
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; MAX_UDP_PAYLOAD];
+            loop {
+                let Ok((len, from)) = socket.recv_from(&mut buffer).await else {
+                    return;
+                };
+                let _ = socket.send_to(&buffer[..len], from).await;
+            }
+        });
+        port
+    }
+
+    impl Paired {
+        /// Opens one UDP route on this session and returns its stream id.
+        fn open_udp(&self, host: &str, port: u16, request_id: [u8; 16]) -> u64 {
+            let (stream_id, _) = self
+                .node
+                .open(
+                    Destination::address(host, port),
+                    Vec::new(),
+                    Proto::Udp,
+                    request_id,
+                )
+                .expect("the Open must queue");
+            stream_id
+        }
+
+        /// The next datagram for `stream_id`, ignoring everything else.
+        async fn read_datagram(&mut self, stream_id: u64) -> (DatagramFields, Vec<u8>) {
+            loop {
+                if let SessionEvent::Datagram { metadata, payload } = self.next().await {
+                    let fields = DatagramFields::from_canonical(&metadata)
+                        .expect("the hub must send readable metadata");
+                    if fields.stream_id == stream_id {
+                        return (fields, payload);
+                    }
+                }
+            }
+        }
+
+        /// Sends one datagram and returns the payload it used.
+        fn send_datagram(&self, fields: DatagramFields, payload: &[u8]) {
+            self.node
+                .send_datagram(fields.to_canonical(), payload.to_vec())
+                .expect("the datagram must queue");
+        }
+    }
+
+    fn datagram_fields(
+        stream_id: u64,
+        association_id: u64,
+        datagram_id: u64,
+        port: u16,
+        remaining_ttl_ms: u64,
+    ) -> DatagramFields {
+        DatagramFields {
+            stream_id,
+            association_id,
+            datagram_id,
+            host: "127.0.0.1".to_string(),
+            port,
+            remaining_ttl_ms,
+        }
+    }
+
+    /// An authorised UDP route carries datagrams both ways over a real socket
+    /// (section 7.4), and the response names the address it actually came from.
+    #[tokio::test]
+    async fn an_authorised_udp_route_carries_datagrams_both_ways() {
+        within(async {
+            let port = bind_udp_echo().await;
+            let mut pair = pair(vec![loopback_rule()]).await;
+
+            let stream_id = pair.open_udp("127.0.0.1", port, [0x51; 16]);
+            let result = pair.open_result(stream_id).await;
+            assert_eq!(result.status, OpenStatus::Ok, "{}", result.detail);
+            assert_eq!(result.detail, DETAIL_UDP_ROUTE_READY);
+
+            pair.send_datagram(datagram_fields(stream_id, 9, 1, port, 1_000), b"ping");
+            let (fields, payload) = pair.read_datagram(stream_id).await;
+            assert_eq!(payload, b"ping");
+            assert_eq!(fields.association_id, 9, "the association must survive");
+            assert_eq!(fields.stream_id, stream_id);
+            // Section 7.4: the response carries the address it really came from.
+            assert_eq!(fields.host, "127.0.0.1");
+            assert_eq!(fields.port, port);
+            assert_eq!(
+                fields.remaining_ttl_ms, UDP_QUEUE_TTL_DEFAULT_MS,
+                "the response starts its own queue budget"
+            );
+
+            // A second datagram on the same route still works, so the first did not
+            // consume the socket.
+            pair.send_datagram(datagram_fields(stream_id, 9, 2, port, 1_000), b"pong");
+            let (_, payload) = pair.read_datagram(stream_id).await;
+            assert_eq!(payload, b"pong");
+
+            pair.entry.handle.close_stream(stream_id);
+        })
+        .await;
+    }
+
+    /// A route belongs to one association, and a spent queue budget is not spent
+    /// twice: both are dropped rather than forwarded.
+    #[tokio::test]
+    async fn a_udp_route_drops_another_association_and_an_expired_datagram() {
+        within(async {
+            let port = bind_udp_echo().await;
+            let mut pair = pair(vec![loopback_rule()]).await;
+            let stream_id = pair.open_udp("127.0.0.1", port, [0x52; 16]);
+            assert_eq!(pair.open_result(stream_id).await.status, OpenStatus::Ok);
+
+            // The first datagram fixes the association...
+            pair.send_datagram(datagram_fields(stream_id, 9, 1, port, 1_000), b"first");
+            assert_eq!(pair.read_datagram(stream_id).await.1, b"first");
+
+            // ...so a later one claiming a different association must be dropped,
+            // followed by a legal datagram whose echo is therefore the next event.
+            pair.send_datagram(datagram_fields(stream_id, 10, 2, port, 1_000), b"intruder");
+            pair.send_datagram(datagram_fields(stream_id, 9, 3, port, 1_000), b"legal");
+            assert_eq!(pair.read_datagram(stream_id).await.1, b"legal");
+
+            // Section 7.4: a datagram whose queue budget is already spent is
+            // dropped rather than delivered late.
+            pair.send_datagram(datagram_fields(stream_id, 9, 4, port, 0), b"expired");
+            pair.send_datagram(datagram_fields(stream_id, 9, 5, port, 1_000), b"fresh");
+            assert_eq!(pair.read_datagram(stream_id).await.1, b"fresh");
+        })
+        .await;
+    }
+
+    /// Section 9.3: the egress guard applies to a UDP route exactly as it does to a
+    /// TCP one, so a route to a special address without an explicit rule is refused.
+    #[tokio::test]
+    async fn a_udp_route_to_loopback_needs_the_explicit_egress_rule() {
+        within(async {
+            let port = bind_udp_echo().await;
+            let mut pair = pair(Vec::new()).await;
+            let stream_id = pair.open_udp("127.0.0.1", port, [0x53; 16]);
+            let result = pair.open_result(stream_id).await;
+            assert_eq!(
+                result.status,
+                OpenStatus::Denied,
+                "a loopback udp route must need an explicit rule: {}",
+                result.detail
+            );
+            assert_eq!(
+                pair.entry.handle.stream_count(),
+                0,
+                "a refused route must register nothing"
+            );
+        })
+        .await;
+    }
+
+    async fn bind_listener() -> (TcpListener, u16) {        let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a loopback listener");
         let port = listener.local_addr().expect("a bound address").port();
