@@ -64,6 +64,14 @@
 - `_net/live_ws.ps1`：把节点配成 `carrier = "ws"` + `url = "http://…"`（**明文 `ws://`，路径上没有任何 TLS**），再跑两条真实流量——SOCKS5 CONNECT 的 TCP 回显，以及 SOCKS5 UDP ASSOCIATE 的数据报回显——并断言节点只绑定了 `ws` 一个载体：`carrier bindings seen: ws=1 post=0 sse=0`。这条断言就是"确实走了 `GET /w`、没有悄悄退回 POST+SSE"的证据。结果 `LIVE WS RESULT: PASS`（连跑两轮）。
   - 这同时说明：明文 `ws://` 不需要任何证书配置即可部署（TLS 由外层 nginx/等价终止），而 `wss://` 目前只信任公开根。
 
+**Linux 实机回归**（root@192.168.100.71：Ubuntu 22.04.5 / x86_64 / 2 核 4 GB，Proxmox 容器；`rustc 1.98.1`；源码用 `git archive` 按提交号送过去，非本地工作树拷贝）：
+
+- `cargo test --workspace --no-fail-fast` → **624 passed / 0 failed**，与 Windows 完全一致。
+- `cargo clippy --workspace --all-targets -- -D warnings` → 干净。
+- `cargo build --release`（工作区自带的 `lto = "thin"`、`codegen-units = 1`）→ 成功，`wsnet` 9,700,784 B、`wsnetd` 5,715,456 B。
+- 用 release 二进制跑明文 `ws` 回归，连跑两轮均 PASS：SOCKS5 CONNECT 与 SOCKS5 UDP ASSOCIATE 都经 `ws://…/w` 往返，且 `carrier bindings seen: ws=1 post=0 sse=0`。
+- 该机器上的 harness 在 `_net/remote_*.sh`、`_net/remote_live_ws.py`（工作区根目录，不在仓库内）。两处环境问题值得记下来：该机 `/root/.gitconfig` 里写着一个**没有监听的** SOCKS5 代理（`socks5://192.168.100.71:7890`），cargo 会继承 git 的代理设置，因此所有 registry 请求都失败——用把 `HOME` 指向空目录的方式绕过，没有改动对方的 git 配置；另外该容器可用内存只有约 1.2 GB 且 swap 被其他租户占用，第一次 release 构建把 SSH 会话打断，改为 `nohup` 后台跑才成功。
+
 ### 本轮修掉的真实缺陷（都由新增测试暴露）
 
 1. **本地关闭 Hub 会话时从不发 `Bye`**：驱动收到 `Command::Close` 直接跳出循环，于是 Hub 一直保留该节点的 lease 与服务注册，直到会话 TTL 到期——期间它还会把调用方的 `Open` 桥到一条没人读的会话上。现在关闭是"宣告式"的：先发 `Bye` 并把记录刷进上行载体，再退出。
