@@ -58,6 +58,12 @@
 
 控制面同样实测通过：`wsnetd serve` + `wsnet run`，日志显示 `Auth`/`AuthOk` 握手、方向密钥派生、`Binding → HelloPending → Ready`，`wsnet status` 显示 `hub-a Ready`。
 
+**用 release 二进制做的实机验证**（harness 在工作区根目录 `_net/` 下，不在仓库内；它们起真 `wsnetd`/`wsnet` 进程，然后从普通客户端驱动真实协议）：
+
+- `_net/live_udp.ps1`：SOCKS5 UDP ASSOCIATE（RFC 要求的全零地址/端口）→ 隧道 → Hub UDP 出口 → 真实回显 socket，应答带真实来源地址。结果 `LIVE UDP RESULT: PASS`。
+- `_net/live_ws.ps1`：把节点配成 `carrier = "ws"` + `url = "http://…"`（**明文 `ws://`，路径上没有任何 TLS**），再跑两条真实流量——SOCKS5 CONNECT 的 TCP 回显，以及 SOCKS5 UDP ASSOCIATE 的数据报回显——并断言节点只绑定了 `ws` 一个载体：`carrier bindings seen: ws=1 post=0 sse=0`。这条断言就是"确实走了 `GET /w`、没有悄悄退回 POST+SSE"的证据。结果 `LIVE WS RESULT: PASS`（连跑两轮）。
+  - 这同时说明：明文 `ws://` 不需要任何证书配置即可部署（TLS 由外层 nginx/等价终止），而 `wss://` 目前只信任公开根。
+
 ### 本轮修掉的真实缺陷（都由新增测试暴露）
 
 1. **本地关闭 Hub 会话时从不发 `Bye`**：驱动收到 `Command::Close` 直接跳出循环，于是 Hub 一直保留该节点的 lease 与服务注册，直到会话 TTL 到期——期间它还会把调用方的 `Open` 桥到一条没人读的会话上。现在关闭是"宣告式"的：先发 `Bye` 并把记录刷进上行载体，再退出。
