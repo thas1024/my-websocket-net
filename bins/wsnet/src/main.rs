@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
+use std::io::IsTerminal as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,6 +130,10 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        // Colour only when a person is watching. A node is normally run under a
+        // supervisor with its output in a file, and an escape sequence in the middle
+        // of `carrier=...` turns a log line into something grep cannot find.
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     match Cli::parse().command {
