@@ -27,7 +27,10 @@
 
 ### 已知缺口（明确列出，避免把设计当成已实现）
 
-- **UDP 尚未打通**：`wsnet-socks` 的 UDP ASSOCIATE 服务端、`wsnet-forward` 的 UDP association 表都有测试，但节点没有把 datagram 送进隧道的路径，Hub 出口也只拨 TCP。因此 `SocksBridge::udp_associate` 仍以明确的“本版本不支持”拒绝，而不是先答成功再让流量消失。接这一条需要四段：Hub 的 UDP 出口与 `Datagram` 路由、节点侧 `Proto::Udp` 流 API、SOCKS5 association 到隧道的映射、以及各自的超时/TTL/去重预算（§7.4）。
+- **UDP 尚未打通**：`wsnet-socks` 的 UDP ASSOCIATE 服务端、`wsnet-forward` 的 UDP association 表都有测试，但节点还没有把 datagram 送进隧道的入口，Hub 出口也只拨 TCP。因此 `SocksBridge::udp_associate` 仍以明确的"本版本不支持"拒绝，而不是先答成功再让流量消失。
+  - 已确定并落地的契约：§4.1 的 `Datagram` metadata 增加 `stream_id` —— 该数据报所属的 **UDP route**（§7.4 每个目标一条 route，一条 route 就是一条 UDP 流）；`association_id` 只用于本地把回复送回正确的 SOCKS5 association，不是会话对象。地址以 `host`+`port` 传递，域名保持未解析由出口解析。`DatagramFields` 已实现并有往返、缺字段、非法地址（空 host / 0 端口 / 端口越界）的测试。
+  - 已落地的节点侧管道：`StreamMsg::Datagram`、`SessionStream::send_datagram` / `recv_datagram`，以及 §7.4 的队列预算（每 association 32 条 / 256 KiB，超额丢最旧一条而不是阻塞——UDP 本来没有交付承诺）。测试覆盖"计数预算先绑定"、"字节预算先绑定"、"字节数据与数据报互不吞掉"。
+  - 仍缺两段：Hub 的 **UDP 出口**（`spawn_hub_exit` 只拨 TCP）与节点 **SOCKS5 UDP association**（每目标一条 route、来源锁定、`FRAG≠0` 丢弃并计数、60 秒 idle、`socks_udp_advertise`）。两段都做完才谈得上端到端可用。
 - **外层 TLS 已用等价实现验证，未用 nginx 实机验证**：本环境没有 nginx，`crates/wsnet-node/tests/tls_front.rs` 用同一个 TLS 库起一个字节级终止代理（不解析 HTTP，因此对 Hub 完全透明），断言整条载体在 TLS 后可用，并断言**默认信任库下同一个部署必须失败**——后者保证证书校验真的在跑，而不是被静默放过。运营商自建 CA 通过 `HttpTransportFactory::with_root_certificate` 接入。`wss://` 的自定义根尚未接线（WebSocket 载体只走公开根）。
 - **WebSocket 载体的健康检查是"载体级"的**：§5.5 要的是一次认证往返。节点的探测顺序是先用 `BindProof` 做一次真实 upgrade（Hub 校验 MAC、nonce、会话存在），只有在它失败时才退回在现役 socket 上做控制帧往返。Hub 侧只有"认证出该会话的那个 socket"结束时才释放租约，所以探测可以来去而不打断会话——这一点由 `tests/ws_carrier.rs` 断言。
 - `services list` 报告的是**Hub 按调用方 ACL 过滤后**广播的 `PeerList`，加上本节点自己发布、而 Hub 尚未回显的条目（后者按 Hub 是否已发过快照标 `Ready`/`Offline`）。节点不会伪造它看不到的远端目录。

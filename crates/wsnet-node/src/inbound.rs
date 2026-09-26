@@ -419,6 +419,13 @@ pub(crate) async fn serve_inbound(
                     }
                     // A raised limit is picked up by the next delivery attempt.
                     Some(StreamMsg::Credit) => trace!(%stream_id, "credit raised"),
+                    // Section 7.4 keeps datagrams on UDP routes. A `Datagram` on a
+                    // TCP route has no association it could belong to, so it is
+                    // dropped rather than written into the byte stream as if it
+                    // were ordered data.
+                    Some(StreamMsg::Datagram(_, _)) => {
+                        debug!(%stream_id, "dropping a datagram on a tcp route");
+                    }
                     None => return,
                 }
             }

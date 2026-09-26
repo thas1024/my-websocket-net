@@ -40,7 +40,8 @@ pub use handshake::{
 };
 pub use message::{
     empty_metadata, negotiate_capabilities, AuthFields, AuthOkFields, ByeFields,
-    CancelCandidateFields, DataFields, FinFields, HelloFields, HelloOkFields, MessageError,
+    CancelCandidateFields, DataFields, DatagramFields, FinFields, HelloFields, HelloOkFields,
+    MessageError,
     OpenFields, OpenResultFields, OpenStatus, ProgressFields, ReadyFields, ResetFields,
     ResetReason, ResumeFields, ServiceRegistration, SUPPORTED_CAPABILITIES,
 };

@@ -607,6 +607,104 @@ impl DataFields {
     }
 }
 
+/// `Datagram` metadata: one complete UDP datagram and where it belongs.
+///
+/// Section 4.1 spells the fields as
+/// `association_id, datagram_id, destination/source_address, remaining_ttl_ms`,
+/// and section 7.4 adds the requirement that one association may hold up to 64
+/// targets, each with its own route. A route is a UDP *stream* — the same
+/// established, credit-checked object a TCP flow uses — so the record also carries
+/// the `stream_id` that names it. Without it neither end could tell which route a
+/// datagram belongs to, because `association_id` is a per-client label and not a
+/// session object.
+///
+/// The address is carried as a host and a port rather than as a parsed
+/// [`wsnet_routing::Destination`] on purpose: section 7.1 keeps a domain
+/// unresolved until the exit, and a union that could also name a service or
+/// another node would invite a datagram to be routed by something other than the
+/// route it arrived on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatagramFields {
+    /// The UDP stream (route) this datagram travels on.
+    pub stream_id: u64,
+    /// The client association that produced it.
+    ///
+    /// Only the sending side interprets this, to route a reply back to the SOCKS5
+    /// association that asked for it; the exit matches responses to routes, which is
+    /// what section 7.4 requires before a response may be forwarded.
+    pub association_id: u64,
+    /// Monotonic per-association id, used only for bounded duplicate suppression
+    /// inside one epoch (section 7.4 explicitly does not promise delivery).
+    pub datagram_id: u64,
+    /// Host as the sender wrote it: a domain stays a domain so the exit resolves it.
+    pub host: String,
+    /// Destination port.
+    pub port: u16,
+    /// Queue TTL left for this datagram, in milliseconds.
+    ///
+    /// Each hop subtracts its own queueing time using a monotonic clock, so the
+    /// value never depends on two hosts agreeing about wall time (section 7.4).
+    pub remaining_ttl_ms: u64,
+}
+
+impl DatagramFields {
+    /// Builds the metadata.
+    pub fn to_canonical(&self) -> Canonical {
+        Canonical::object([
+            (
+                "association_id",
+                Canonical::u64_decimal(self.association_id),
+            ),
+            ("datagram_id", Canonical::u64_decimal(self.datagram_id)),
+            ("host", Canonical::str(self.host.clone())),
+            ("port", Canonical::u64_decimal(u64::from(self.port))),
+            (
+                "remaining_ttl_ms",
+                Canonical::u64_decimal(self.remaining_ttl_ms),
+            ),
+            ("stream_id", Canonical::u64_decimal(self.stream_id)),
+        ])
+    }
+
+    /// Parses the metadata.
+    ///
+    /// A zero port and an empty host are refused here rather than by a later
+    /// `connect`: both can only come from a malformed peer, and a refusal names the
+    /// field instead of surfacing as an OS-level dial error.
+    pub fn from_canonical(value: &Canonical) -> Result<Self, MessageError> {
+        const KIND: &str = "Datagram";
+        let host = string_field(value, "host", KIND)?;
+        if host.is_empty() {
+            return Err(MessageError::Nested {
+                kind: KIND,
+                field: "host",
+                reason: "the host is empty".to_string(),
+            });
+        }
+        let port = decimal_field(value, "port", KIND)?;
+        let port = u16::try_from(port).map_err(|_| MessageError::Nested {
+            kind: KIND,
+            field: "port",
+            reason: format!("port {port} is out of range"),
+        })?;
+        if port == 0 {
+            return Err(MessageError::Nested {
+                kind: KIND,
+                field: "port",
+                reason: "port 0 is not a datagram destination".to_string(),
+            });
+        }
+        Ok(DatagramFields {
+            stream_id: decimal_field(value, "stream_id", KIND)?,
+            association_id: decimal_field(value, "association_id", KIND)?,
+            datagram_id: decimal_field(value, "datagram_id", KIND)?,
+            host,
+            port,
+            remaining_ttl_ms: decimal_field(value, "remaining_ttl_ms", KIND)?,
+        })
+    }
+}
+
 /// `Fin` metadata: the half-close and the offset it closes at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FinFields {
@@ -940,6 +1038,80 @@ mod tests {
         assert_eq!(parsed, fields);
         assert_eq!(mac, [5u8; 32]);
         assert_eq!(parsed.signing_canonical().to_bytes(), fields.signing_canonical().to_bytes());
+    }
+
+    #[test]
+    fn datagram_metadata_round_trips_with_the_route_it_belongs_to() {
+        let fields = DatagramFields {
+            stream_id: 7,
+            association_id: 3,
+            datagram_id: 11,
+            host: "example.com".to_string(),
+            port: 53,
+            remaining_ttl_ms: 1_000,
+        };
+        let value = fields.to_canonical();
+        assert_eq!(DatagramFields::from_canonical(&value).unwrap(), fields);
+        // Every unsigned field travels as a decimal string (section 4.1), so a
+        // JSON number would be unreadable to the peer rather than merely unstylish.
+        for field in [
+            "stream_id",
+            "association_id",
+            "datagram_id",
+            "port",
+            "remaining_ttl_ms",
+        ] {
+            assert!(
+                value.get_str(field).is_ok(),
+                "{field} must be a decimal string"
+            );
+        }
+    }
+
+    /// A route is named, not guessed: a snapshot without `stream_id` is refused.
+    #[test]
+    fn datagram_metadata_requires_its_stream_id() {
+        let value = Canonical::object([
+            ("association_id", Canonical::u64_decimal(1)),
+            ("datagram_id", Canonical::u64_decimal(1)),
+            ("host", Canonical::str("example.com")),
+            ("port", Canonical::u64_decimal(53)),
+            ("remaining_ttl_ms", Canonical::u64_decimal(1_000)),
+        ]);
+        assert!(matches!(
+            DatagramFields::from_canonical(&value),
+            Err(MessageError::MissingField {
+                kind: "Datagram",
+                field: "stream_id"
+            })
+        ));
+    }
+
+    #[test]
+    fn datagram_metadata_rejects_an_unusable_address() {
+        let base = |host: &str, port: u64| {
+            Canonical::object([
+                ("association_id", Canonical::u64_decimal(1)),
+                ("datagram_id", Canonical::u64_decimal(1)),
+                ("host", Canonical::str(host)),
+                ("port", Canonical::u64_decimal(port)),
+                ("remaining_ttl_ms", Canonical::u64_decimal(1_000)),
+                ("stream_id", Canonical::u64_decimal(7)),
+            ])
+        };
+        assert!(matches!(
+            DatagramFields::from_canonical(&base("", 53)),
+            Err(MessageError::Nested { field: "host", .. })
+        ));
+        assert!(matches!(
+            DatagramFields::from_canonical(&base("example.com", 0)),
+            Err(MessageError::Nested { field: "port", .. })
+        ));
+        // A port that does not fit in `u16` is a malformed peer, not a truncation.
+        assert!(matches!(
+            DatagramFields::from_canonical(&base("example.com", 70_000)),
+            Err(MessageError::Nested { field: "port", .. })
+        ));
     }
 
     #[test]

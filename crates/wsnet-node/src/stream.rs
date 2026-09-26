@@ -25,8 +25,10 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
-use wsnet_limits::STREAM_MAX_CREDIT;
-use wsnet_session::{ResetReason, SessionError, SessionHandle};
+use wsnet_limits::{
+    MAX_QUEUED_DATAGRAMS_PER_ASSOCIATION, MAX_QUEUED_DATAGRAM_BYTES, STREAM_MAX_CREDIT,
+};
+use wsnet_session::{DatagramFields, ResetReason, SessionError, SessionHandle};
 use wsnet_stream::StreamError;
 
 /// One update the session driver hands to a single stream.
@@ -34,6 +36,8 @@ use wsnet_stream::StreamError;
 pub(crate) enum StreamMsg {
     /// Ordered business bytes.
     Data(Vec<u8>),
+    /// One complete datagram on this stream's UDP route (section 7.4).
+    Datagram(Box<DatagramFields>, Vec<u8>),
     /// The peer raised the granted credit.
     Credit,
     /// The peer half-closed at this exclusive offset.
@@ -60,6 +64,15 @@ pub struct SessionStream {
     write_buf: Vec<u8>,
     fin_sent: bool,
     write_closed: bool,
+    /// Datagrams that arrived for this stream's UDP route but have not been taken.
+    ///
+    /// Section 7.4 keeps datagrams out of the byte path on purpose ("不与 TCP
+    /// offset 混用"), so they queue here rather than in `read_buf`; the same section
+    /// bounds the queue by count and by bytes.
+    datagrams: VecDeque<(DatagramFields, Vec<u8>)>,
+    /// Bytes held in `datagrams`, so the section 7.4 byte budget is enforced without
+    /// summing the queue on every arrival.
+    datagram_bytes: usize,
 }
 
 impl SessionStream {
@@ -80,6 +93,59 @@ impl SessionStream {
             write_buf: Vec::new(),
             fin_sent: false,
             write_closed: false,
+            datagrams: VecDeque::new(),
+            datagram_bytes: 0,
+        }
+    }
+
+    /// Datagrams waiting to be taken.
+    pub fn queued_datagrams(&self) -> usize {
+        self.datagrams.len()
+    }
+
+    /// Bytes held in the datagram queue (section 7.4's 256 KiB budget).
+    pub fn queued_datagram_bytes(&self) -> usize {
+        self.datagram_bytes
+    }
+
+    /// Sends one complete datagram on this stream's UDP route (section 7.4).
+    ///
+    /// The caller supplies `association_id` and `datagram_id`; this type only
+    /// carries them, because the association those numbers describe lives above the
+    /// stream (one association, many routes). An oversized payload is refused by the
+    /// record layer, which is the layer section 7.4 gives the "one datagram, one
+    /// record, never split" rule to.
+    pub fn send_datagram(
+        &self,
+        fields: DatagramFields,
+        payload: &[u8],
+    ) -> Result<(), SessionError> {
+        self.handle
+            .send_datagram(fields.to_canonical(), payload.to_vec())
+    }
+
+    /// Takes the next datagram, waiting for one to arrive.
+    ///
+    /// Returns `None` once the stream is over and no datagram is left. Byte data
+    /// that arrives meanwhile is kept for the byte path rather than discarded, and
+    /// counts as delivered only when a read takes it, exactly as section 7.5
+    /// requires of credit.
+    pub async fn recv_datagram(&mut self) -> Option<(DatagramFields, Vec<u8>)> {
+        loop {
+            // Absorb everything already queued before taking one, so section 7.4's
+            // count and byte budgets apply to a *burst*: absorbing a single message
+            // per call would leave the queue one entry deep and make the budgets
+            // unreachable, which is the opposite of what they are for.
+            while let Ok(message) = self.rx.try_recv() {
+                self.absorb(message);
+            }
+            if let Some(datagram) = self.take_datagram() {
+                return Some(datagram);
+            }
+            match self.rx.recv().await {
+                Some(message) => self.absorb(message),
+                None => return None,
+            }
         }
     }
 
@@ -92,6 +158,7 @@ impl SessionStream {
     fn absorb(&mut self, message: StreamMsg) {
         match message {
             StreamMsg::Data(payload) => self.read_buf.extend(payload),
+            StreamMsg::Datagram(fields, payload) => self.queue_datagram(*fields, payload),
             StreamMsg::Credit => {}
             StreamMsg::Fin(final_offset) => {
                 // Section 7.2: the offset, not the arrival order, decides when the
@@ -103,6 +170,36 @@ impl SessionStream {
             }
             StreamMsg::Reset(reason) => self.reset = Some(reason),
         }
+    }
+
+    /// Queues one datagram inside section 7.4's count and byte budgets.
+    ///
+    /// When the queue is full the *oldest* datagram is dropped, not the new one:
+    /// UDP has no delivery promise here (section 7.4 says so explicitly), and for a
+    /// real-time-ish flow the datagram that has been waiting longest is the one
+    /// least worth keeping. A refusal would instead hand the sender backpressure it
+    /// cannot use, since a datagram cannot be retried without changing the
+    /// protocol's meaning.
+    fn queue_datagram(&mut self, fields: DatagramFields, payload: Vec<u8>) {
+        while self.datagrams.len() >= MAX_QUEUED_DATAGRAMS_PER_ASSOCIATION
+            || self.datagram_bytes + payload.len() > MAX_QUEUED_DATAGRAM_BYTES
+        {
+            let Some((_, dropped)) = self.datagrams.pop_front() else {
+                break;
+            };
+            self.datagram_bytes -= dropped.len();
+        }
+        // A single payload larger than the whole budget was already refused by the
+        // record layer, so this can only be reached with a legal payload.
+        self.datagram_bytes += payload.len();
+        self.datagrams.push_back((fields, payload));
+    }
+
+    /// Removes the next queued datagram, if any.
+    fn take_datagram(&mut self) -> Option<(DatagramFields, Vec<u8>)> {
+        let (fields, payload) = self.datagrams.pop_front()?;
+        self.datagram_bytes -= payload.len();
+        Some((fields, payload))
     }
 
     /// Drains every queued driver message, registering a waker when the channel
@@ -442,5 +539,115 @@ mod tests {
         let mut stream = SessionStream::new(session.handle, 1, rx);
         let mut buf = [0u8; 4];
         assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
+    }
+
+    // ------------------------------------------------------------- section 7.4
+
+    fn datagram(id: u64, payload: &[u8]) -> (DatagramFields, Vec<u8>) {
+        (
+            DatagramFields {
+                stream_id: 1,
+                association_id: 2,
+                datagram_id: id,
+                host: "example.com".to_string(),
+                port: 53,
+                remaining_ttl_ms: 1_000,
+            },
+            payload.to_vec(),
+        )
+    }
+
+    /// Section 7.4 bounds a queue by count *and* by bytes, and drops rather than
+    /// blocking: a datagram has no delivery promise to break.
+    #[tokio::test]
+    async fn the_datagram_queue_honours_the_section_7_4_budgets() {
+        let session: Session = Session::new(
+            SessionConfig::new("hub-a", "client-a", [1u8; 16], [2u8; 16], Side::Node),
+            keys(),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut stream = SessionStream::new(session.handle, 1, rx);
+
+        // One past the count budget. Nothing is absorbed until the first take, and
+        // that take drains the whole burst first: the budgets exist for a burst, so
+        // applying them one message at a time would make them unreachable.
+        let overflow = MAX_QUEUED_DATAGRAMS_PER_ASSOCIATION + 8;
+        for id in 0..overflow as u64 {
+            let (fields, payload) = datagram(id, b"x");
+            tx.send(StreamMsg::Datagram(Box::new(fields), payload))
+                .unwrap();
+        }
+        let first = stream.recv_datagram().await.expect("a queued datagram");
+        assert_eq!(
+            first.0.datagram_id, 8,
+            "the oldest datagrams must be the ones dropped"
+        );
+        assert_eq!(
+            stream.queued_datagrams(),
+            MAX_QUEUED_DATAGRAMS_PER_ASSOCIATION - 1,
+            "the count budget must bind at {MAX_QUEUED_DATAGRAMS_PER_ASSOCIATION}"
+        );
+
+        // Then the byte budget, with a small count so only bytes can bind.
+        let session: Session = Session::new(
+            SessionConfig::new("hub-a", "client-a", [1u8; 16], [2u8; 16], Side::Node),
+            keys(),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut stream = SessionStream::new(session.handle, 1, rx);
+        let chunk = vec![0u8; MAX_QUEUED_DATAGRAM_BYTES / 4];
+        for id in 0..8u64 {
+            let (fields, payload) = datagram(id, &chunk);
+            tx.send(StreamMsg::Datagram(Box::new(fields), payload))
+                .unwrap();
+        }
+        let first = stream.recv_datagram().await.expect("a queued datagram");
+        assert_eq!(
+            first.0.datagram_id, 4,
+            "only four chunks fit the byte budget"
+        );
+        assert!(
+            stream.queued_datagram_bytes() <= MAX_QUEUED_DATAGRAM_BYTES,
+            "held {} bytes, budget is {MAX_QUEUED_DATAGRAM_BYTES}",
+            stream.queued_datagram_bytes()
+        );
+        assert_eq!(stream.queued_datagrams(), 3, "three chunks are left");
+
+        // Draining restores the byte accounting, so the budget is not a one-way
+        // leak of the structure's capacity. The sender has to go first: an empty
+        // queue with a live channel is simply "nothing yet", which is a wait, not an
+        // end.
+        drop(tx);
+        while stream.recv_datagram().await.is_some() {}
+        assert_eq!(stream.queued_datagram_bytes(), 0);
+        assert_eq!(stream.queued_datagrams(), 0);
+    }
+
+    /// A datagram and byte data share one channel without either being lost.
+    #[tokio::test]
+    async fn datagrams_and_bytes_do_not_consume_each_other() {
+        let session: Session = Session::new(
+            SessionConfig::new("hub-a", "client-a", [1u8; 16], [2u8; 16], Side::Node),
+            keys(),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut stream = SessionStream::new(session.handle, 1, rx);
+
+        let (fields, payload) = datagram(7, b"dgram");
+        tx.send(StreamMsg::Data(b"bytes".to_vec())).unwrap();
+        tx.send(StreamMsg::Datagram(Box::new(fields.clone()), payload))
+            .unwrap();
+        tx.send(StreamMsg::Fin(5)).unwrap();
+        drop(tx);
+
+        // Reading the byte path must not swallow the datagram that arrived in
+        // between, which is what "不与 TCP offset 混用" means in practice.
+        let mut got = Vec::new();
+        stream.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"bytes");
+        let taken = stream.recv_datagram().await.expect("the datagram survived");
+        assert_eq!(taken.0, fields);
+        assert_eq!(taken.1, b"dgram");
+        assert!(stream.recv_datagram().await.is_none());
     }
 }

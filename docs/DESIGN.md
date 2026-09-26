@@ -94,7 +94,7 @@ SOCKS5 / 路由 / 服务授权
 
 - metadata 为规范 JSON：UTF-8、键排序、无重复键、整数不用浮点表示；签名所需整数用十进制字符串，以避免跨语言精度损失。签名输入字段有明确长度前缀。
 - TCP `Data` metadata：`stream_id:u64, offset:u64`；offset 是本方向原始业务字节起点，不含 framing/padding。重传必须保持已分配分块边界。
-- `Datagram`：`association_id, datagram_id:u64, destination/source_address, remaining_ttl_ms`；一条逻辑记录一份完整 UDP 数据报，不与 TCP offset 混用。
+- `Datagram`：`stream_id:u64, association_id, datagram_id:u64, destination/source_address, remaining_ttl_ms`；一条逻辑记录一份完整 UDP 数据报，不与 TCP offset 混用。`stream_id` 是该数据报所属的 **UDP route**（§7.4 里每个目标一条 route，一条 route 就是一条 UDP 流），没有它两端都无法判断这条数据报属于哪条 route：`association_id` 是本地用来把回复送回正确 SOCKS5 association 的标签，不是会话对象。地址以 `host` + `port` 传输，域名保持未解析由出口解析（§7.1）。
 - `Fin{stream_id, final_offset}` 是半关闭；`Reset{stream_id, reason}` 是终止，不把 Reset 当半关闭。
 - 单记录明文最大 96 KiB，TCP payload 默认最大 16 KiB，UDP 上限见 §7.4；metadata 最大 4 KiB、padding 最大 1 KiB。认证引导总长最大 4 KiB。先限长再分配/解码。
 

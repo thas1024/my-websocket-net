@@ -733,6 +733,19 @@ impl Driver {
             SessionEvent::Progress(fields) => {
                 self.deliver(fields.stream_id, StreamMsg::Credit);
             }
+            SessionEvent::Datagram { metadata, payload } => {
+                // Section 4.1 puts the route in the datagram's own metadata, so a
+                // record with an unreadable one belongs to no route and is dropped
+                // rather than guessed at (section 7.4 drops an unmapped datagram).
+                match wsnet_session::DatagramFields::from_canonical(&metadata) {
+                    Ok(fields) => {
+                        self.deliver(fields.stream_id, StreamMsg::Datagram(Box::new(fields), payload));
+                    }
+                    Err(error) => {
+                        debug!(%error, "dropping a datagram with unreadable metadata");
+                    }
+                }
+            }
             SessionEvent::PeerList(value) => {
                 let mut directory = lock(&self.directory);
                 // Section 8: a snapshot that is not newer is dropped, so a
